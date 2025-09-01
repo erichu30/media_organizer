@@ -60,7 +60,7 @@ func NewConfig() *Config {
 	flag.BoolVar(&config.OnlyDateTimeOriginal, "only-datetimeoriginal", false, "Only process files with DateTimeOriginal tag")
 	flag.BoolVar(&config.UseFileModifyDate, "use-file-modify-date", false, "Use file modify date as a fallback")
 	// Use custom usage/help function
-	flag.Usage = showHelp
+			flag.Usage = showHelp
 
 	// If user passed --help or -h explicitly, print help and exit early.
 	for _, a := range os.Args[1:] {
