@@ -66,7 +66,7 @@ func TestExtractDate(t *testing.T) {
 	cmd := exec.Command("exiftool", "-DateTimeOriginal="+dateTimeOriginal, dummyFilePath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("Failed to run exiftool: %v\nOutput: %s", err, string(output))
+		t.Skipf("Skipping test: exiftool not available or failed to run.\nError: %v\nOutput: %s", err, string(output))
 	}
 
 	// Create a new ExifToolService
