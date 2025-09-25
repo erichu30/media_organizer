@@ -45,7 +45,7 @@ Organize media files by date (YYYY/MM) using EXIF data, with optional remote rsy
 
 Required:
 	-i <dir>        Input directory
-	-o <dir|dest>   Output: local directory (default) OR remote rsync destination when used with --rsync
+	-o <dir|dest>   Output: local directory (default) OR remote destination formatted user@host:/remote/path with rsync module
 
 Options:
   -buffer int
