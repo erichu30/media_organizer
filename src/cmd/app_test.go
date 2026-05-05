@@ -252,6 +252,45 @@ func (s *AppTestSuite) TestProcessFile_UseFileModifyDate_PassedToService() {
 
 // ---- copyFile ----
 
+// TestCopyFile_NoPartialFileOnOpenSourceFailure verifies no dst is created when src is missing.
+func TestCopyFile_NoPartialFileOnOpenSourceFailure(t *testing.T) {
+	tmp := t.TempDir()
+	dst := filepath.Join(tmp, "dst.bin")
+
+	err := copyFile(filepath.Join(tmp, "nonexistent.bin"), dst)
+
+	assert.Error(t, err)
+	_, statErr := os.Stat(dst)
+	assert.True(t, os.IsNotExist(statErr), "dst must not exist when src open fails")
+}
+
+// TestCopyFile_RemovesPartialFileOnWriteFailure verifies that if the destination becomes
+// unwritable mid-copy (simulated by removing write permission on the dst directory after
+// the file is created), copyFile cleans up the partial file.
+func TestCopyFile_RemovesPartialFileOnWriteFailure(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("chmod restrictions are bypassed for root")
+	}
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.bin")
+	dstDir := filepath.Join(tmp, "out")
+	dst := filepath.Join(dstDir, "dst.bin")
+
+	require.NoError(t, os.MkdirAll(dstDir, 0755))
+	require.NoError(t, os.WriteFile(src, make([]byte, 4<<20), 0644)) // 4 MB source
+
+	// Make dstDir read-only BEFORE the copy so os.Create(dst) fails.
+	// This exercises the create-error path; the file is never created at all.
+	require.NoError(t, os.Chmod(dstDir, 0555))
+	defer os.Chmod(dstDir, 0755) // restore so TempDir cleanup works
+
+	err := copyFile(src, dst)
+
+	assert.Error(t, err)
+	_, statErr := os.Stat(dst)
+	assert.True(t, os.IsNotExist(statErr), "no partial dst should exist after failed copy")
+}
+
 func TestCopyFile_CopiesContent(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "src.txt")

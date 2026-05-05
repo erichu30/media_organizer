@@ -97,7 +97,59 @@ A package-level `sync.Pool` recycles 1 MiB buffers across `copyFile` calls. `io.
 
 ---
 
-## 4. Combined Effect Summary
+## 4. Correctness & Safety Fixes
+
+Two medium-severity issues were identified and resolved alongside the performance work.
+
+### 4.1 ExifTool pool instance lost on panic
+
+**File:** `src/internal/exiftool_pool.go`
+
+The original `ExtractDate` returned the service to the pool with a plain statement:
+
+```go
+// before
+svc := <-p.pool
+t, tag, err := svc.ExtractDate(...)   // panic here skips the next line
+p.pool <- svc
+```
+
+A panic inside `svc.ExtractDate` (e.g. from a corrupted file triggering a bug in go-exiftool) would skip `p.pool <- svc`. The instance is permanently lost. Once all N instances are lost this way, every subsequent worker blocks forever on `<-p.pool` — a goroutine leak.
+
+**Fix:** return via `defer` so the instance is always given back, including during panic unwinding:
+
+```go
+// after
+svc := <-p.pool
+defer func() { p.pool <- svc }()
+return svc.ExtractDate(...)
+```
+
+### 4.2 Partial destination file left on copy failure
+
+**File:** `src/cmd/sort_by_date.go`
+
+The original `copyFile` used `defer out.Close()`. If `io.CopyBuffer` failed mid-write (disk full, I/O error), the deferred close ran but left the half-written file at `dst` intact — silently corrupting the output directory.
+
+**Fix:** close `out` explicitly so the result can be checked, then remove `dst` if either the copy or the sync step failed:
+
+```go
+// after
+_, copyErr := io.CopyBuffer(out, in, *bufp)
+syncErr    := out.Sync()
+closeErr   := out.Close()
+
+if copyErr != nil || syncErr != nil {
+    os.Remove(dst)   // clean up the partial file
+    ...
+}
+```
+
+`closeErr` alone (copy and sync both succeeded) does not trigger removal — the data is already safely on disk after `Sync()`.
+
+---
+
+## 5. Combined Effect Summary
 
 | Improvement | Before | After | Gain |
 |---|---|---|---|
@@ -106,5 +158,7 @@ A package-level `sync.Pool` recycles 1 MiB buffers across `copyFile` calls. `io.
 | Copy throughput — 10 MB file | 545 MB/s | 1,074 MB/s | **1.97×** |
 | Copy throughput — 1 MB file | 179 MB/s | 199 MB/s | 1.12× |
 | SSH `mkdir -p` calls (remote, same month) | 1 per file | 1 total | **N×** |
+| Pool instance leak on panic | goroutine leak | no leak (`defer` return) | — |
+| Partial file on copy failure | corrupt file left on disk | file removed on error | — |
 
 The **ExifTool pool** is the dominant improvement for mixed photo/video libraries because EXIF extraction was the only stage that could not parallelise under the original design. The **directory cache** is a near-zero-cost micro-optimisation with disproportionate impact when files cluster in the same month. The **copy buffer** matters most for camera RAW or video workflows where individual files are ≥ 10 MB.

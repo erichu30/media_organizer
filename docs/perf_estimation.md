@@ -4,8 +4,8 @@
 **Configuration:** 8 workers (default), copy mode unless noted  
 **Go version:** 1.25  
 
-All figures are measured via `go test -bench=. -benchmem -benchtime=5s` on real hardware.  
-Extrapolated values are marked with *.
+All figures are measured via `go test -bench=. -benchmem -benchtime=5s` on real hardware.
+Extrapolated values are marked `*`.
 
 ---
 
@@ -25,7 +25,7 @@ Fixed per-call overhead (file open + create + fsync) is ~4 ms regardless of size
 | 1 GB* | ~1,360 ms | ~735 MB/s* | ~80 KB* |
 | 4 GB* | ~5,440 ms | ~735 MB/s* | ~80 KB* |
 
-> Throughput plateaus at ~735–773 MB/s for files ≥ 100 MB — the SSD sequential write limit. Files smaller than 1 MB are dominated by fixed syscall overhead; optimising data transfer rate has negligible effect in that range.
+> Throughput plateaus at ~735–773 MB/s for files ≥ 100 MB, which is the SSD sequential write limit. Files smaller than 1 MB are dominated by fixed syscall overhead, so optimising data transfer rate has negligible effect in that range.
 
 > For **move mode** (`os.Rename`, same filesystem), the operation is a metadata-only update: ~50 µs per file regardless of size.
 
@@ -45,7 +45,7 @@ Walk is O(n). Per-file cost is ~0.6 µs; memory usage is ~366 bytes per path.
 | 500,000* | ~310 ms | ~183 MB* | 0.62* | 366* |
 | 1,000,000* | ~620 ms | ~366 MB* | 0.62* | 366* |
 
-> Walk time is almost always negligible compared to EXIF extraction and file I/O. The path buffer is the main memory cost; it is held entirely in RAM from scan to end of run.
+> Walk time is negligible compared to EXIF extraction and file I/O. The path buffer is the main memory cost and is held in RAM for the entire run.
 
 ---
 
@@ -60,7 +60,7 @@ Measured with `b.RunParallel` on tagged JPEG files; pool size matches worker cou
 | 8 | 179,319 | 5,577 |
 | 16* | ~145,000* | ~6,897* |
 
-> Scaling is sub-linear above 8 because of shared I/O bandwidth and OS scheduling. Diminishing returns beyond 8 workers on a 10-core machine.
+> Scaling is sub-linear above 8 due to shared I/O bandwidth and OS scheduling overhead. Diminishing returns are expected beyond 8 workers on a 10-core machine.
 
 ---
 
@@ -161,6 +161,6 @@ Peak memory: 1,000 × 366 B + 8 MB + 120 MB ≈ **128 MB**
 ## 6. Caveats
 
 - All copy benchmarks are **local NVMe SSD → same SSD**. Network shares (NFS, SMB), spinning HDDs, or USB drives will be 5–50× slower on the copy stage.
-- EXIF extraction times assume files with standard JPEG/MP4 metadata. Files with unusually large or deeply nested EXIF blocks may take longer.
-- The `~15 MB per exiftool process` estimate is approximate; actual RSS depends on the Perl runtime version installed.
-- Estimates assume no filesystem contention (no other large I/O running concurrently).
+- EXIF extraction times assume standard JPEG/MP4 metadata. Files with unusually large or deeply nested EXIF blocks may take longer.
+- The ~15 MB per exiftool process estimate is approximate; actual RSS depends on the installed Perl runtime version.
+- Estimates assume no concurrent filesystem contention.

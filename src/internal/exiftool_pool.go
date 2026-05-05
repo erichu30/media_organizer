@@ -35,11 +35,12 @@ func NewExifToolPool(n int) (*ExifToolPool, error) {
 }
 
 // ExtractDate acquires an idle ExifToolService, delegates the call, then returns it to the pool.
+// The return is deferred so the instance is always given back — even if svc.ExtractDate panics —
+// preventing the pool from draining and future callers from blocking forever.
 func (p *ExifToolPool) ExtractDate(path string, debug bool, useFileModifyDate bool) (time.Time, string, error) {
 	svc := <-p.pool
-	t, tag, err := svc.ExtractDate(path, debug, useFileModifyDate)
-	p.pool <- svc
-	return t, tag, err
+	defer func() { p.pool <- svc }()
+	return svc.ExtractDate(path, debug, useFileModifyDate)
 }
 
 // Close shuts down all instances. Must only be called after all workers have finished.

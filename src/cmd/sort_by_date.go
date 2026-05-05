@@ -331,6 +331,7 @@ var copyBufPool = sync.Pool{
 }
 
 // copyFile copies a file from src to dst using a pooled 1 MiB buffer.
+// If the copy or sync fails, dst is removed so no partial file is left behind.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -342,15 +343,24 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
 	bufp := copyBufPool.Get().(*[]byte)
 	defer copyBufPool.Put(bufp)
 
-	if _, err := io.CopyBuffer(out, in, *bufp); err != nil {
-		return err
+	_, copyErr := io.CopyBuffer(out, in, *bufp)
+	syncErr := out.Sync()
+	closeErr := out.Close()
+
+	// copyErr or syncErr mean the data on disk is incomplete or unsafe.
+	// Remove dst so a re-run can start fresh rather than finding a corrupt file.
+	if copyErr != nil || syncErr != nil {
+		os.Remove(dst) // best-effort; ignore remove error — we already have a more important one to return
+		if copyErr != nil {
+			return copyErr
+		}
+		return syncErr
 	}
-	return out.Sync()
+	return closeErr
 }
 
 

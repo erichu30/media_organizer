@@ -15,62 +15,48 @@ A command-line tool to organize media files (photos and videos) into a directory
 
 ## Dependencies
 
-Before using this tool, you need to have the following software installed:
-
-- **Go**: The programming language used to build the tool. You can install it from the [official Go website](https://golang.org/).
-- **ExifTool**: A command-line tool for reading and writing EXIF data. You can install it from the [official ExifTool website](https://exiftool.org/).
-- **rsync**: A command-line tool for transferring files. It is used for the remote sync feature.
+- **Go** — [golang.org](https://golang.org/)
+- **ExifTool** — reads EXIF metadata; [exiftool.org](https://exiftool.org/)
+- **rsync** — required only for remote transfers (`-o user@host:/path`)
 
 ## Installation
 
-### Option 1: Docker (no local dependencies required)
+### Option 1: Docker (recommended — no local dependencies required)
 
-Docker bundles Go, ExifTool, and rsync — nothing else needs to be installed.
+```bash
+docker build -t media-organizer .
+```
 
-1.  **Build the image:**
-    ```bash
-    docker build -t media-organizer .
-    ```
+```bash
+# Basic run
+docker run --rm \
+  -v /path/to/input:/input \
+  -v /path/to/output:/output \
+  media-organizer -i /input -o /output
 
-2.  **Run:**
-    ```bash
-    docker run --rm \
-      -v /path/to/input:/input \
-      -v /path/to/output:/output \
-      media-organizer -i /input -o /output
-    ```
+# Persist the log file
+docker run --rm \
+  -v /path/to/input:/input \
+  -v /path/to/output:/output \
+  -v /path/to/logs:/data \
+  media-organizer -i /input -o /output
 
-    Mount an extra volume if you want to keep the log file:
-    ```bash
-    docker run --rm \
-      -v /path/to/input:/input \
-      -v /path/to/output:/output \
-      -v /path/to/logs:/data \
-      media-organizer -i /input -o /output
-    ```
-
-    For remote rsync transfers, pass your SSH key into the container:
-    ```bash
-    docker run --rm \
-      -v /path/to/input:/input \
-      -v ~/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
-      media-organizer -i /input -o user@host:/remote/path
-    ```
+# Remote rsync — mount your SSH key
+docker run --rm \
+  -v /path/to/input:/input \
+  -v ~/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+  media-organizer -i /input -o user@host:/remote/path
+```
 
 ### Option 2: Build from source
 
-1.  **Clone the repository:**
-    ```bash
-    git clone <repository-url>
-    cd media_organizer
-    ```
+```bash
+git clone <repository-url>
+cd media_organizer
+./build.sh
+```
 
-2.  **Build the tool:**
-    A build script is provided for convenience.
-    ```bash
-    ./build.sh
-    ```
-    This will create an executable named `sort_by_date` in the `build` directory.
+This creates `build/sort_by_date`.
 
 ## Usage
 
@@ -111,4 +97,4 @@ Examples:
 
 ## Logging
 
-The tool logs all its operations to a file named `sortbydate.log` in the same directory where you run the tool. In case of errors or unexpected behavior, this file will contain detailed information.
+All operations are logged to `sortbydate.log` in the current working directory. Check this file for details when errors or unexpected behaviour occur.
