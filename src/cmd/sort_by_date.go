@@ -51,6 +51,7 @@ type ExifService interface {
 type App struct {
 	Config      *Config
 	ExifService ExifService
+	dirCache    sync.Map // caches directories already created; avoids redundant MkdirAll/SSH mkdir calls
 }
 
 // NewConfig creates a new Config object from command-line flags.
@@ -105,15 +106,15 @@ func main() {
 
 	setupLogging(config.Debug)
 
-	exifService, err := internal.NewExifToolService()
+	pool, err := internal.NewExifToolPool(config.Workers)
 	if err != nil {
-		logrus.Fatalf("Failed to initialize ExifToolService: %v", err)
+		logrus.Fatalf("Failed to initialize ExifToolPool: %v", err)
 	}
-	defer exifService.Close()
+	defer pool.Close()
 
 	app := &App{
 		Config:      config,
-		ExifService: exifService,
+		ExifService: pool,
 	}
 
 	app.Run()
@@ -238,17 +239,23 @@ func (app *App) processFile(path string) error {
 		remoteHost := remoteParts[0]
 		remoteBaseDir := remoteParts[1]
 		targetDir = filepath.Join(remoteBaseDir, year, month)
-		sshCmd := exec.Command("ssh", remoteHost, "mkdir", "-p", targetDir)
-		if app.Config.Debug {
-			logrus.Debugf("Executing: %s", sshCmd.String())
-		}
-		if err := sshCmd.Run(); err != nil {
-			return fmt.Errorf("failed to create remote dir %s: %w", targetDir, err)
+		if _, loaded := app.dirCache.Load(targetDir); !loaded {
+			sshCmd := exec.Command("ssh", remoteHost, "mkdir", "-p", targetDir)
+			if app.Config.Debug {
+				logrus.Debugf("Executing: %s", sshCmd.String())
+			}
+			if err := sshCmd.Run(); err != nil {
+				return fmt.Errorf("failed to create remote dir %s: %w", targetDir, err)
+			}
+			app.dirCache.Store(targetDir, struct{}{})
 		}
 	} else {
 		targetDir = filepath.Join(app.Config.OutputPath, year, month)
-		if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
-			return fmt.Errorf("failed to create dir %s: %w", targetDir, err)
+		if _, loaded := app.dirCache.Load(targetDir); !loaded {
+			if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
+				return fmt.Errorf("failed to create dir %s: %w", targetDir, err)
+			}
+			app.dirCache.Store(targetDir, struct{}{})
 		}
 	}
 
@@ -314,7 +321,16 @@ func (app *App) extractDate(path string) (time.Time, error) {
 	return t, nil
 }
 
-// copyFile copies a file from a source to a destination.
+// copyBufPool recycles 1 MiB buffers across copyFile calls to reduce allocations and GC pressure.
+// 1 MiB is chosen to amortise syscall overhead for large video files while staying CPU-cache friendly.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 1<<20)
+		return &b
+	},
+}
+
+// copyFile copies a file from src to dst using a pooled 1 MiB buffer.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -328,10 +344,12 @@ func copyFile(src, dst string) error {
 	}
 	defer out.Close()
 
-	if _, err := io.Copy(out, in); err != nil {
+	bufp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufp)
+
+	if _, err := io.CopyBuffer(out, in, *bufp); err != nil {
 		return err
 	}
-
 	return out.Sync()
 }
 
