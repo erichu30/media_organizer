@@ -23,6 +23,42 @@ Before using this tool, you need to have the following software installed:
 
 ## Installation
 
+### Option 1: Docker (no local dependencies required)
+
+Docker bundles Go, ExifTool, and rsync — nothing else needs to be installed.
+
+1.  **Build the image:**
+    ```bash
+    docker build -t media-organizer .
+    ```
+
+2.  **Run:**
+    ```bash
+    docker run --rm \
+      -v /path/to/input:/input \
+      -v /path/to/output:/output \
+      media-organizer -i /input -o /output
+    ```
+
+    Mount an extra volume if you want to keep the log file:
+    ```bash
+    docker run --rm \
+      -v /path/to/input:/input \
+      -v /path/to/output:/output \
+      -v /path/to/logs:/data \
+      media-organizer -i /input -o /output
+    ```
+
+    For remote rsync transfers, pass your SSH key into the container:
+    ```bash
+    docker run --rm \
+      -v /path/to/input:/input \
+      -v ~/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+      media-organizer -i /input -o user@host:/remote/path
+    ```
+
+### Option 2: Build from source
+
 1.  **Clone the repository:**
     ```bash
     git clone <repository-url>
