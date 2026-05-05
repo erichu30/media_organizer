@@ -41,10 +41,16 @@ type Config struct {
 	IsRemote             bool
 }
 
+// ExifService is the interface for extracting dates from media files.
+// Defined at the consumer site so App can be tested without a real exiftool process.
+type ExifService interface {
+	ExtractDate(path string, debug bool, useFileModifyDate bool) (time.Time, string, error)
+}
+
 // App represents the application state, including configuration and services.
 type App struct {
 	Config      *Config
-	ExifService *internal.ExifToolService
+	ExifService ExifService
 }
 
 // NewConfig creates a new Config object from command-line flags.
