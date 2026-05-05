@@ -22,9 +22,10 @@ import (
 	"sync"
 	"time"
 
+	"media_organizer/src/internal"
+
 	"github.com/schollz/progressbar/v3"
 	"github.com/sirupsen/logrus"
-	"media_organizer/src/internal"
 )
 
 // Config holds the application configuration, populated from command-line flags.
@@ -67,7 +68,7 @@ func NewConfig() *Config {
 	flag.BoolVar(&config.OnlyDateTimeOriginal, "only-datetimeoriginal", false, "Only process files with DateTimeOriginal tag")
 	flag.BoolVar(&config.UseFileModifyDate, "use-file-modify-date", false, "Use file modify date as a fallback")
 	// Use custom usage/help function
-			flag.Usage = showHelp
+	flag.Usage = showHelp
 
 	// If user passed --help or -h explicitly, print help and exit early.
 	for _, a := range os.Args[1:] {
@@ -106,6 +107,11 @@ func main() {
 
 	setupLogging(config.Debug)
 
+	if err := validatePaths(config); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		logrus.Fatal(err)
+	}
+
 	pool, err := internal.NewExifToolPool(config.Workers)
 	if err != nil {
 		logrus.Fatalf("Failed to initialize ExifToolPool: %v", err)
@@ -120,9 +126,40 @@ func main() {
 	app.Run()
 }
 
+// validatePaths ensures the input and output directories are correctly set up.
+// It handles both local (Mac/Linux) paths and remote (rsync via SSH) connections.
+func validatePaths(config *Config) error {
+	// Validate input path exists and is a directory
+	info, err := os.Stat(config.InputPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("input path does not exist: %s", config.InputPath)
+		}
+		return fmt.Errorf("failed to access input path: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("input path must be a directory: %s", config.InputPath)
+	}
+
+	if config.IsRemote {
+		// For remote output, ensure standard Mac/Linux tools 'rsync' and 'ssh' are available in PATH
+		for _, cmd := range []string{"rsync", "ssh"} {
+			if _, err := exec.LookPath(cmd); err != nil {
+				return fmt.Errorf("%s command not found, required for remote output sync", cmd)
+			}
+		}
+	} else {
+		// For local Mac/Linux paths, ensure output directory exists or can be created with safe default permissions (0755)
+		if err := os.MkdirAll(config.OutputPath, 0755); err != nil {
+			return fmt.Errorf("failed to create or access output directory: %w", err)
+		}
+	}
+	return nil
+}
+
 // showHelp prints a concise usage message and examples.
 func showHelp() {
-		fmt.Fprintf(os.Stderr, `Usage: %s [OPTIONS]
+	fmt.Fprintf(os.Stderr, `Usage: %s [OPTIONS]
 
 Organize media files by date (YYYY/MM) using EXIF data, with optional remote rsync transfer.
 
@@ -133,8 +170,8 @@ Required:
 
 Options:
 `, os.Args[0])
-		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, `
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr, `
 Examples:
 	%s -i /path/to/input -o /path/to/output
 	%s -i /path/to/input -o user@host:/remote/path --copy
@@ -362,8 +399,3 @@ func copyFile(src, dst string) error {
 	}
 	return closeErr
 }
-
-
-
-
-
