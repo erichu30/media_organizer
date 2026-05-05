@@ -92,6 +92,12 @@ func setupLogging(debug bool) {
 		logrus.Fatalf("Failed to open log file: %v", err)
 	}
 	logrus.SetOutput(logFile)
+	logrus.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+		ForceQuote:      false,
+		PadLevelText:    true,
+	})
 	if debug {
 		logrus.SetLevel(logrus.DebugLevel)
 	} else {
