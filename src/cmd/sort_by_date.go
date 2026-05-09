@@ -11,6 +11,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"media_organizer/src/internal"
@@ -393,7 +395,19 @@ func (app *App) processFile(path string) (string, error) {
 			return "", nil
 		}
 		if err := os.Rename(path, targetPath); err != nil {
-			return "file operation failed", err
+			var linkErr *os.LinkError
+			if errors.As(err, &linkErr) && errors.Is(linkErr.Err, syscall.EXDEV) {
+				// Source and destination are on different filesystems (e.g. local → SMB/NFS mount).
+				// os.Rename only works within a single device; fall back to copy + delete.
+				if copyErr := copyFile(path, targetPath); copyErr != nil {
+					return "file operation failed", copyErr
+				}
+				if removeErr := os.Remove(path); removeErr != nil {
+					return "file operation failed", removeErr
+				}
+			} else {
+				return "file operation failed", err
+			}
 		}
 	}
 
