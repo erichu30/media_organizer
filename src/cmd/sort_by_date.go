@@ -18,8 +18,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"media_organizer/src/internal"
@@ -48,11 +50,65 @@ type ExifService interface {
 	ExtractDate(path string, debug bool, useFileModifyDate bool) (time.Time, string, error)
 }
 
+// Stats tracks per-run outcomes for the final summary.
+type Stats struct {
+	success atomic.Int64
+	mu      sync.Mutex
+	failed  map[string]int64
+}
+
+func (s *Stats) addSuccess() { s.success.Add(1) }
+
+func (s *Stats) addFailure(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed == nil {
+		s.failed = make(map[string]int64)
+	}
+	s.failed[reason]++
+}
+
+func (s *Stats) print(total, skipped int) {
+	s.mu.Lock()
+	reasons := make([]string, 0, len(s.failed))
+	counts := make(map[string]int64, len(s.failed))
+	for r, n := range s.failed {
+		reasons = append(reasons, r)
+		counts[r] = n
+	}
+	s.mu.Unlock()
+
+	sort.Strings(reasons)
+	var totalFailed int64
+	for _, n := range counts {
+		totalFailed += n
+	}
+
+	fmt.Printf("\n--- Summary ---\n")
+	fmt.Printf("  Processed : %d\n", total)
+	fmt.Printf("  Success   : %d\n", s.success.Load())
+	fmt.Printf("  Failed    : %d\n", totalFailed)
+	for _, r := range reasons {
+		fmt.Printf("    %-32s %d\n", r+":", counts[r])
+	}
+	if skipped > 0 {
+		fmt.Printf("  Skipped   : %d (non-media files)\n", skipped)
+	}
+}
+
 // App represents the application state, including configuration and services.
 type App struct {
 	Config      *Config
 	ExifService ExifService
-	dirCache    sync.Map // caches directories already created; avoids redundant MkdirAll/SSH mkdir calls
+	dirCache    sync.Map // caches local directories already created; avoids redundant MkdirAll calls
+	stats       Stats
+}
+
+// isRclonePath returns true when p uses rclone remote syntax (remotename:path).
+// Local paths (no colon) and legacy SSH destinations (user@host:/path) are excluded.
+func isRclonePath(p string) bool {
+	idx := strings.IndexByte(p, ':')
+	return idx > 0 && !strings.ContainsRune(p[:idx], '@')
 }
 
 // NewConfig creates a new Config object from command-line flags.
@@ -80,7 +136,7 @@ func NewConfig() *Config {
 
 	flag.Parse()
 
-	config.IsRemote = strings.Contains(config.OutputPath, "@") && strings.Contains(config.OutputPath, ":")
+	config.IsRemote = isRclonePath(config.OutputPath)
 
 	return config
 }
@@ -148,11 +204,8 @@ func validatePaths(config *Config) error {
 	}
 
 	if config.IsRemote {
-		// For remote output, ensure standard Mac/Linux tools 'rsync' and 'ssh' are available in PATH
-		for _, cmd := range []string{"rsync", "ssh"} {
-			if _, err := exec.LookPath(cmd); err != nil {
-				return fmt.Errorf("%s command not found, required for remote output sync", cmd)
-			}
+		if _, err := exec.LookPath("rclone"); err != nil {
+			return fmt.Errorf("rclone command not found, required for remote output sync")
 		}
 	} else {
 		// For local Mac/Linux paths, ensure output directory exists or can be created with safe default permissions (0755)
@@ -172,7 +225,7 @@ Organize media files by date (YYYY/MM) using EXIF data, with optional remote rsy
 Required:
 	-i <dir>        Input directory
 	-o <dir|dest>   Output: local directory or
-							remote destination formatted user@host:/remote/path with rsync module
+							rclone remote destination formatted as remotename:path (e.g. mysftp:/photos)
 
 Options:
 `, os.Args[0])
@@ -190,8 +243,8 @@ func (app *App) Run() {
 	startTime := time.Now()
 
 	// Step 1: Walk the input directory to count files and collect paths.
-	paths, total := app.collectFiles()
-	logrus.Infof("Estimated total files: %d", total)
+	paths, total, skipped := app.collectFiles()
+	logrus.Infof("Estimated total files: %d (skipped non-media: %d)", total, skipped)
 
 	bar := progressbar.NewOptions(total,
 		progressbar.OptionSetDescription("Processing"),
@@ -221,12 +274,14 @@ func (app *App) Run() {
 
 	elapsed := time.Since(startTime)
 	logrus.Infof("Processing finished. Total files: %d, Elapsed time: %s", total, elapsed)
+
+	app.stats.print(total, skipped)
 }
 
-// collectFiles walks the input directory, counts the files, and returns a slice of file paths.
-func (app *App) collectFiles() ([]string, int) {
+// collectFiles walks the input directory and returns media file paths, a media count, and a skipped-non-media count.
+func (app *App) collectFiles() ([]string, int, int) {
 	var paths []string
-	var count int
+	var count, skipped int
 	filepath.WalkDir(app.Config.InputPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if os.IsPermission(err) {
@@ -244,12 +299,17 @@ func (app *App) collectFiles() ([]string, int) {
 		}
 
 		if !d.IsDir() {
+			if !isMediaFile(path) {
+				logrus.Debugf("Skipping non-media file: %s", path)
+				skipped++
+				return nil
+			}
 			paths = append(paths, path)
 			count++
 		}
 		return nil
 	})
-	return paths, count
+	return paths, count, skipped
 }
 
 // worker is a routine that processes files from the jobs channel.
@@ -259,44 +319,37 @@ func (app *App) worker(id int, jobs <-chan string, wg *sync.WaitGroup, bar *prog
 		if app.Config.Debug {
 			logrus.Debugf("Worker %d handling %s", id, path)
 		}
-		if err := app.processFile(path); err != nil {
+		reason, err := app.processFile(path)
+		if err != nil {
 			logrus.Errorf("Failed processing %s: %v", path, err)
+			app.stats.addFailure(reason)
+		} else {
+			app.stats.addSuccess()
 		}
 		bar.Add(1)
 	}
 }
 
 // processFile handles the logic for a single file: extracting the date, determining the destination, and moving/copying.
-func (app *App) processFile(path string) error {
-	t, err := app.extractDate(path)
+// Returns a short failure-reason string (empty on success) alongside any error.
+func (app *App) processFile(path string) (string, error) {
+	t, reason, err := app.extractDate(path)
 	if err != nil {
 		logrus.Warnf("Cannot extract date for %s: %v", path, err)
-		return err
+		return reason, err
 	}
 
 	year := fmt.Sprintf("%04d", t.Year())
 	month := fmt.Sprintf("%02d", int(t.Month()))
 	var targetDir string
 	if app.Config.IsRemote {
-		remoteParts := strings.Split(app.Config.OutputPath, ":")
-		remoteHost := remoteParts[0]
-		remoteBaseDir := remoteParts[1]
-		targetDir = filepath.Join(remoteBaseDir, year, month)
-		if _, loaded := app.dirCache.Load(targetDir); !loaded {
-			sshCmd := exec.Command("ssh", remoteHost, "mkdir", "-p", targetDir)
-			if app.Config.Debug {
-				logrus.Debugf("Executing: %s", sshCmd.String())
-			}
-			if err := sshCmd.Run(); err != nil {
-				return fmt.Errorf("failed to create remote dir %s: %w", targetDir, err)
-			}
-			app.dirCache.Store(targetDir, struct{}{})
-		}
+		// rclone creates destination directories automatically; no mkdir step needed
+		targetDir = app.Config.OutputPath + "/" + year + "/" + month
 	} else {
 		targetDir = filepath.Join(app.Config.OutputPath, year, month)
 		if _, loaded := app.dirCache.Load(targetDir); !loaded {
 			if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
-				return fmt.Errorf("failed to create dir %s: %w", targetDir, err)
+				return "directory creation failed", fmt.Errorf("failed to create dir %s: %w", targetDir, err)
 			}
 			app.dirCache.Store(targetDir, struct{}{})
 		}
@@ -311,7 +364,7 @@ func (app *App) processFile(path string) error {
 
 	if app.Config.DryRun {
 		logrus.Infof("[DRY-RUN] Move: %s → %s (copy=%v)", path, targetPath, app.Config.CopyMode)
-		return nil
+		return "", nil
 	}
 
 	logrus.Infof("Move: %s → %s (copy=%v)", path, targetPath, app.Config.CopyMode)
@@ -321,47 +374,72 @@ func (app *App) processFile(path string) error {
 	}
 
 	if app.Config.IsRemote {
-		args := []string{"-aHAXv"}
-		if !app.Config.CopyMode {
-			args = append(args, "--remove-source-files")
+		subCmd := "moveto"
+		if app.Config.CopyMode {
+			subCmd = "copyto"
 		}
-		args = append(args, path, targetPath)
-		rsyncCmd := exec.Command("rsync", args...)
+		rcloneCmd := exec.Command("rclone", subCmd, path, targetPath)
 		if app.Config.Debug {
-			logrus.Debugf("Executing: %s", rsyncCmd.String())
+			logrus.Debugf("Executing: %s", rcloneCmd.String())
 		}
-		if output, err := rsyncCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to rsync %s: %w, output: %s", path, err, string(output))
+		if output, err := rcloneCmd.CombinedOutput(); err != nil {
+			return "file operation failed", fmt.Errorf("rclone %s %s: %w, output: %s", subCmd, path, err, string(output))
 		}
 	} else {
 		if app.Config.CopyMode {
-			return copyFile(path, targetPath)
+			if err := copyFile(path, targetPath); err != nil {
+				return "file operation failed", err
+			}
+			return "", nil
 		}
-		return os.Rename(path, targetPath)
+		if err := os.Rename(path, targetPath); err != nil {
+			return "file operation failed", err
+		}
 	}
 
-	return nil
+	return "", nil
 }
 
 // extractDate extracts the date from a file's metadata.
-func (app *App) extractDate(path string) (time.Time, error) {
+// Returns a short failure-reason string (empty on success) alongside any error.
+func (app *App) extractDate(path string) (time.Time, string, error) {
 	t, tag, err := app.ExifService.ExtractDate(path, app.Config.Debug, app.Config.UseFileModifyDate)
 	if err != nil {
 		logrus.Errorf("Failed to extract date for %s: %v", path, err)
-		return time.Time{}, err
+		return time.Time{}, "no EXIF date", err
 	}
 
 	hasDateTimeOriginal := tag == "DateTimeOriginal"
 	if app.Config.OnlyDateTimeOriginal && !hasDateTimeOriginal {
 		logrus.Infof("Skipping %s because it does not have DateTimeOriginal tag", path)
-		return time.Time{}, fmt.Errorf("DateTimeOriginal not found")
+		return time.Time{}, "DateTimeOriginal not found", fmt.Errorf("DateTimeOriginal not found")
 	}
 
 	if t.IsZero() {
 		logrus.Warnf("No valid date found for %s", path)
-		return time.Time{}, fmt.Errorf("no valid date found in EXIF or file system")
+		return time.Time{}, "no EXIF date", fmt.Errorf("no valid date found in EXIF or file system")
 	}
-	return t, nil
+	return t, "", nil
+}
+
+// mediaExtensions is the set of file extensions recognised as media.
+// Keys are lowercase; matching is case-insensitive via strings.ToLower.
+var mediaExtensions = map[string]struct{}{
+	// Images
+	".jpg": {}, ".jpeg": {}, ".png": {}, ".gif": {}, ".bmp": {}, ".webp": {},
+	".heic": {}, ".heif": {},
+	".tiff": {}, ".tif": {},
+	".raw": {}, ".cr2": {}, ".cr3": {}, ".nef": {}, ".arw": {}, ".dng": {},
+	".orf": {}, ".rw2": {}, ".pef": {}, ".srw": {},
+	// Videos
+	".mp4": {}, ".mov": {}, ".m4v": {}, ".avi": {}, ".mkv": {},
+	".mts": {}, ".m2ts": {}, ".3gp": {}, ".3g2": {},
+	".wmv": {}, ".flv": {}, ".ts": {}, ".mpg": {}, ".mpeg": {},
+}
+
+func isMediaFile(path string) bool {
+	_, ok := mediaExtensions[strings.ToLower(filepath.Ext(path))]
+	return ok
 }
 
 // copyBufPool recycles 1 MiB buffers across copyFile calls to reduce allocations and GC pressure.

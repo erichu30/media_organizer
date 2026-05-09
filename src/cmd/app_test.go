@@ -62,14 +62,14 @@ func (s *AppTestSuite) TestCollectFiles_ReturnsAllFiles() {
 	s.writeFile("a.jpg", "a")
 	s.writeFile("b.mp4", "b")
 
-	paths, count := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	paths, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(2, count)
 	s.Len(paths, 2)
 }
 
 func (s *AppTestSuite) TestCollectFiles_EmptyDir() {
-	paths, count := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	paths, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(0, count)
 	s.Empty(paths)
@@ -81,7 +81,7 @@ func (s *AppTestSuite) TestCollectFiles_NestedFiles() {
 	require.NoError(s.T(), os.WriteFile(filepath.Join(sub, "nested.jpg"), []byte("x"), 0644))
 	s.writeFile("root.jpg", "y")
 
-	_, count := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	_, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(2, count)
 }
@@ -92,7 +92,7 @@ func (s *AppTestSuite) TestCollectFiles_SkipsSpotlightDir() {
 	require.NoError(s.T(), os.WriteFile(filepath.Join(dir, "hidden.jpg"), []byte("x"), 0644))
 	s.writeFile("visible.jpg", "y")
 
-	paths, count := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	paths, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(1, count)
 	s.Contains(paths[0], "visible.jpg")
@@ -103,7 +103,7 @@ func (s *AppTestSuite) TestCollectFiles_SkipsFseventsd() {
 	require.NoError(s.T(), os.MkdirAll(dir, 0755))
 	require.NoError(s.T(), os.WriteFile(filepath.Join(dir, "event"), []byte("x"), 0644))
 
-	_, count := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	_, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(0, count)
 }
@@ -113,9 +113,35 @@ func (s *AppTestSuite) TestCollectFiles_SkipsDocumentRevisions() {
 	require.NoError(s.T(), os.MkdirAll(dir, 0755))
 	require.NoError(s.T(), os.WriteFile(filepath.Join(dir, "rev"), []byte("x"), 0644))
 
-	_, count := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	_, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(0, count)
+}
+
+func (s *AppTestSuite) TestCollectFiles_SkipsNonMediaFiles() {
+	s.writeFile("photo.jpg", "a")
+	s.writeFile("document.pdf", "b")
+	s.writeFile("readme.txt", "c")
+	s.writeFile("clip.mp4", "d")
+
+	paths, count, skipped := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+
+	s.Equal(2, count)
+	s.Equal(2, skipped)
+	s.Len(paths, 2)
+	for _, p := range paths {
+		s.True(p[len(p)-4:] == ".jpg" || p[len(p)-4:] == ".mp4")
+	}
+}
+
+func (s *AppTestSuite) TestCollectFiles_CaseInsensitiveExtension() {
+	s.writeFile("PHOTO.JPG", "a")
+	s.writeFile("clip.MP4", "b")
+
+	_, count, skipped := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+
+	s.Equal(2, count)
+	s.Equal(0, skipped)
 }
 
 // ---- processFile ----
@@ -128,7 +154,7 @@ func (s *AppTestSuite) TestProcessFile_LocalMove() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	err := s.appWith(&Config{OutputPath: outDir}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir}, svc).processFile(src)
 
 	s.NoError(err)
 	s.noFile(src, "source should be removed after move")
@@ -144,7 +170,7 @@ func (s *AppTestSuite) TestProcessFile_LocalCopy() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	err := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(src)
 
 	s.NoError(err)
 	s.hasFile(src)
@@ -160,7 +186,7 @@ func (s *AppTestSuite) TestProcessFile_DryRun_NoChanges() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	err := s.appWith(&Config{OutputPath: outDir, DryRun: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, DryRun: true}, svc).processFile(src)
 
 	s.NoError(err)
 	s.hasFile(src)
@@ -177,7 +203,8 @@ func (s *AppTestSuite) TestProcessFile_DateFolderStructure() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	s.NoError(s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(src))
+	_, processErr := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(src)
+	s.NoError(processErr)
 
 	s.hasFile(filepath.Join(outDir, "2001", "09", "img.jpg"))
 }
@@ -188,7 +215,7 @@ func (s *AppTestSuite) TestProcessFile_NoDate_ReturnsError() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(time.Time{}, "", nil)
 
-	err := s.appWith(&Config{OutputPath: s.tmpDir}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: s.tmpDir}, svc).processFile(src)
 
 	s.Error(err)
 	svc.AssertExpectations(s.T())
@@ -200,7 +227,7 @@ func (s *AppTestSuite) TestProcessFile_ExifError_ReturnsError() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(time.Time{}, "", assert.AnError)
 
-	err := s.appWith(&Config{OutputPath: s.tmpDir}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: s.tmpDir}, svc).processFile(src)
 
 	s.Error(err)
 	svc.AssertExpectations(s.T())
@@ -214,7 +241,7 @@ func (s *AppTestSuite) TestProcessFile_OnlyDateTimeOriginal_SkipsCreateDate() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "CreateDate", nil)
 
-	err := s.appWith(&Config{OutputPath: outDir, OnlyDateTimeOriginal: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, OnlyDateTimeOriginal: true}, svc).processFile(src)
 
 	s.Error(err)
 	s.hasFile(src)
@@ -229,7 +256,7 @@ func (s *AppTestSuite) TestProcessFile_OnlyDateTimeOriginal_AllowsDateTimeOrigin
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	err := s.appWith(&Config{OutputPath: outDir, OnlyDateTimeOriginal: true, CopyMode: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, OnlyDateTimeOriginal: true, CopyMode: true}, svc).processFile(src)
 
 	s.NoError(err)
 	svc.AssertExpectations(s.T())
@@ -244,7 +271,7 @@ func (s *AppTestSuite) TestProcessFile_UseFileModifyDate_PassedToService() {
 	// UseFileModifyDate=true must be forwarded as the third arg
 	svc.On("ExtractDate", src, false, true).Return(fixedTime, "FileModifyDate", nil)
 
-	err := s.appWith(&Config{OutputPath: outDir, UseFileModifyDate: true, CopyMode: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, UseFileModifyDate: true, CopyMode: true}, svc).processFile(src)
 
 	s.NoError(err)
 	svc.AssertExpectations(s.T())

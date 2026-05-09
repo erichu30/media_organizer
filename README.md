@@ -5,19 +5,21 @@ A command-line tool to organize media files (photos and videos) into a directory
 ## Features
 
 - **Organize by Date**: Automatically moves or copies files into a `YYYY/MM` folder structure.
+- **Media-only filtering**: Only processes recognised media files (images and videos); other file types are automatically skipped and counted in the summary.
 - **EXIF-based**: Extracts the creation date from EXIF metadata tags (`DateTimeOriginal`, `CreateDate`, `DateCreated`).
 - **Fallback to File Date**: Can use the file's modification date if no EXIF date is found.
 - **Concurrent Processing**: Uses a worker pool to process files in parallel, significantly speeding up the process for large collections.
 - **Flexible Operation**: Supports both moving and copying files.
 - **Dry-Run Mode**: Preview the results without making any changes to your files.
 - **Remote Sync**: Transfer files to a remote server using `rsync`.
+- **Run Summary**: Prints a brief summary to stdout after processing — total processed, success count, and failed count broken down by reason.
 - **Logging**: Keeps a log of all operations in `sortbydate.log`.
 
 ## Dependencies
 
 - **Go** — [golang.org](https://golang.org/)
 - **ExifTool** — reads EXIF metadata; [exiftool.org](https://exiftool.org/)
-- **rsync** — required only for remote transfers (`-o user@host:/path`)
+- **rclone** — required only for remote transfers (`-o remotename:path`); supports S3, GCS, Dropbox, SFTP, and 40+ other backends
 
 ## Installation
 
@@ -41,11 +43,11 @@ docker run --rm \
   -v /path/to/logs:/data \
   media-organizer -i /input -o /output
 
-# Remote rsync — mount your SSH key
+# Remote via rclone — mount your rclone config
 docker run --rm \
   -v /path/to/input:/input \
-  -v ~/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
-  media-organizer -i /input -o user@host:/remote/path
+  -v ~/.config/rclone:/root/.config/rclone:ro \
+  media-organizer -i /input -o myremote:/photos
 ```
 
 ### Option 2: Build from source
@@ -63,11 +65,11 @@ This creates `build/sort_by_date`.
 ```
 Usage: ./build/sort_by_date [OPTIONS]
 
-Organize media files by date (YYYY/MM) using EXIF data, with optional remote rsync transfer.
+Organize media files by date (YYYY/MM) using EXIF data, with optional remote rclone transfer.
 
 Required:
 	-i <dir>        Input directory
-	-o <dir|dest>   Output: local directory (default) OR remote destination formatted user@host:/remote/path with rsync module
+	-o <dir|dest>   Output: local directory (default) OR rclone remote destination formatted as remotename:path
 
 Options:
   -buffer int
@@ -91,9 +93,36 @@ Options:
 
 Examples:
 	./build/sort_by_date -i /path/to/input -o /path/to/output
-	./build/sort_by_date -i /path/to/input -o user@host:/remote/path --copy
+	./build/sort_by_date -i /path/to/input -o myremote:/photos --copy
 	./build/sort_by_date -i /path/to/input -o /path/to/output --dry-run
 ```
+
+## Summary Output
+
+After all files are processed, a brief summary is printed to stdout:
+
+```
+--- Summary ---
+  Processed : 150
+  Success   : 143
+  Failed    : 7
+    DateTimeOriginal not found:      3
+    directory creation failed:       1
+    file operation failed:           2
+    no EXIF date:                    1
+```
+
+**Supported media extensions** (case-insensitive):
+- Images: `.jpg` `.jpeg` `.png` `.gif` `.bmp` `.webp` `.heic` `.heif` `.tiff` `.tif` `.raw` `.cr2` `.cr3` `.nef` `.arw` `.dng` `.orf` `.rw2` `.pef` `.srw`
+- Videos: `.mp4` `.mov` `.m4v` `.avi` `.mkv` `.mts` `.m2ts` `.3gp` `.3g2` `.wmv` `.flv` `.ts` `.mpg` `.mpeg`
+
+Files with any other extension are silently skipped (logged at debug level) and appear as **Skipped** in the summary.
+
+Possible failure reasons:
+- `no EXIF date` — exiftool could not extract any date from the file
+- `DateTimeOriginal not found` — file was skipped because `-only-datetimeoriginal` is set and the tag is absent
+- `directory creation failed` — could not create the target `YYYY/MM` directory (local or remote)
+- `file operation failed` — the move, copy, or rsync step failed
 
 ## Logging
 

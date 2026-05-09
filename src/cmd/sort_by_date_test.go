@@ -51,11 +51,19 @@ func TestNewConfig_AllFlags(t *testing.T) {
 }
 
 func TestNewConfig_RemoteOutput(t *testing.T) {
-	resetFlags(t, []string{"-i", "/input", "-o", "user@host:/remote/path"})
+	resetFlags(t, []string{"-i", "/input", "-o", "myremote:/remote/path"})
 	cfg := NewConfig()
 
 	assert.True(t, cfg.IsRemote)
-	assert.Equal(t, "user@host:/remote/path", cfg.OutputPath)
+	assert.Equal(t, "myremote:/remote/path", cfg.OutputPath)
+}
+
+func TestNewConfig_SSHPathNotRemote(t *testing.T) {
+	// Legacy user@host:/path syntax is no longer treated as remote; users must configure an rclone remote.
+	resetFlags(t, []string{"-i", "/input", "-o", "user@host:/remote/path"})
+	cfg := NewConfig()
+
+	assert.False(t, cfg.IsRemote)
 }
 
 func TestNewConfig_LocalOutputNotRemote(t *testing.T) {
@@ -144,11 +152,11 @@ func TestValidatePaths_RemoteMissingTools(t *testing.T) {
 
 	cfg := &Config{
 		InputPath:  inDir,
-		OutputPath: "user@host:/path",
+		OutputPath: "myremote:/path",
 		IsRemote:   true,
 	}
 
-	// Clear PATH temporarily to simulate missing rsync/ssh commands
+	// Clear PATH temporarily to simulate missing rclone
 	origPath := os.Getenv("PATH")
 	defer os.Setenv("PATH", origPath)
 	os.Setenv("PATH", "")
@@ -165,16 +173,12 @@ func TestValidatePaths_RemoteSuccess(t *testing.T) {
 
 	cfg := &Config{
 		InputPath:  inDir,
-		OutputPath: "user@host:/path",
+		OutputPath: "myremote:/path",
 		IsRemote:   true,
 	}
 
-	// Ensure the test skips instead of failing if the testing environment lacks rsync/ssh
-	if _, err := exec.LookPath("rsync"); err != nil {
-		t.Skip("rsync not found in PATH, skipping remote success test")
-	}
-	if _, err := exec.LookPath("ssh"); err != nil {
-		t.Skip("ssh not found in PATH, skipping remote success test")
+	if _, err := exec.LookPath("rclone"); err != nil {
+		t.Skip("rclone not found in PATH, skipping remote success test")
 	}
 
 	err := validatePaths(cfg)
