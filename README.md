@@ -15,6 +15,7 @@ A command-line tool to organize media files (photos and videos) into a directory
 - **Timestamp Preservation**: When copying, the destination file retains the original `FileModifyDate`, `FileAccessDate`, and (on macOS) `FileCreatedDate` — EXIF file metadata is unchanged.
 - **Run Summary**: Prints a brief summary to stdout after processing — total processed, success count, and failed count broken down by reason.
 - **Structured Failure Log**: Optionally writes one NDJSON record per failed file (`-failure-log auto` or `-failure-log <path>`), including path, size, reason, error, and duration.
+- **Pre-transfer Info**: Before starting, prints file count and total size. With `-estimate` (remote mode), transfers two sample files (10th and 90th percentile by size) to measure per-file SSH overhead and bandwidth, then shows a projected total transfer time.
 - **Signal Handling**: Responds to `SIGINT` (Ctrl-C), `SIGTERM`, and `SIGHUP` with a graceful shutdown — in-progress file operations finish before exit, all buffers are flushed, and the summary is printed with a partial-results warning. A second signal force-quits immediately.
 - **Logging**: Keeps a log of all operations in `sortbydate.log`.
 
@@ -84,6 +85,8 @@ Options:
     	Enable debug logging
   -dry-run
     	Show what would be done, without moving/copying files
+  -estimate
+    	Sample two files to measure destination speed and show a time estimate (remote only; skipped in dry-run)
   -i string
     	Input directory
   -o string
@@ -92,10 +95,10 @@ Options:
     	Write failed-file records as NDJSON to this path ("auto" = timestamp-based filename)
   -only-datetimeoriginal
     	Only process files with DateTimeOriginal tag
-  -retries int
-    	rclone retry count for transient remote errors — SSH disconnect, timeouts (default 3)
   -remote-fail-threshold int
     	abort after this many consecutive remote failures; 0 to disable (default 5)
+  -retries int
+    	rclone retry count for transient remote errors — SSH disconnect, timeouts (default 3)
   -ssh-key string
     	Path to SSH private key for user@host:/path destinations (e.g. ~/.ssh/id_ed25519)
   -use-file-modify-date
@@ -107,10 +110,47 @@ Examples:
 	./build/sort_by_date -i /path/to/input -o /path/to/output
 	./build/sort_by_date -i /path/to/input -o myremote:/photos -copy
 	./build/sort_by_date -i /path/to/input -o root@192.168.1.10:/mnt/nas/photos -ssh-key ~/.ssh/id_ed25519
+	./build/sort_by_date -i /path/to/input -o root@192.168.1.10:/mnt/nas/photos -ssh-key ~/.ssh/id_ed25519 -estimate
 	./build/sort_by_date -i /path/to/input -o /path/to/output -dry-run
 	./build/sort_by_date -i /path/to/input -o /path/to/output -failure-log auto
 	./build/sort_by_date -i /path/to/input -o /path/to/output -failure-log /tmp/failures.ndjson
 ```
+
+## Pre-transfer Info
+
+Before any file is moved or copied, the tool prints a quick summary of what it found:
+
+```
+--- Pre-transfer ---
+  Files      : 142
+  Total size : 1.8 GB
+  (add -estimate to measure destination speed)
+```
+
+### Transfer time estimate (`-estimate`, remote only)
+
+Pass `-estimate` to have the tool transfer two sample files (10th and 90th percentile by size) to the destination under temporary names, measure the round-trip time, and fit a two-parameter model:
+
+```
+time = α (per-file SSH overhead) + β × bytes (bandwidth)
+```
+
+The temporary probe files are deleted immediately; the main run is unaffected.
+
+```
+--- Pre-transfer ---
+  Files      : 142
+  Total size : 1.8 GB
+  Probing    : transferring sample file(s)... done
+  Probe      : 245.0 KB + 12.3 MB sampled
+  Per-file   : ~380 ms overhead
+  Bandwidth  : ~22.4 MB/s
+  Estimated  : ~1 min 37 sec
+```
+
+The two-file probe separates fixed SSH/rclone startup cost from actual data-transfer cost, which gives a more accurate estimate than a single sample — especially for collections of many small files where handshake overhead dominates.
+
+> **Note:** `-estimate` is skipped in `-dry-run` mode (no files are transferred to the destination).
 
 ## Summary Output
 
