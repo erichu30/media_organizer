@@ -5,14 +5,15 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY src/ ./src/
-RUN go build -o sort_by_date src/cmd/sort_by_date.go
+RUN go build -o sort_by_date ./src/cmd/
 
 FROM alpine:3.21
 
 RUN apk add --no-cache \
     exiftool \
-    rsync \
-    openssh-client
+    rclone \
+    openssh-client \
+    --repository https://dl-cdn.alpinelinux.org/alpine/edge/community
 
 WORKDIR /data
 
