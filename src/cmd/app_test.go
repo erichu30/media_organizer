@@ -262,6 +262,29 @@ func (s *AppTestSuite) TestProcessFile_OnlyDateTimeOriginal_AllowsDateTimeOrigin
 	svc.AssertExpectations(s.T())
 }
 
+// TestProcessFile_CopyPreservesModTime verifies that after a local copy the destination
+// file keeps the same mtime as the source, not the time of the copy operation.
+func (s *AppTestSuite) TestProcessFile_CopyPreservesModTime() {
+	src := s.writeFile("photo.jpg", "data")
+	outDir := filepath.Join(s.tmpDir, "output")
+
+	wantMtime := time.Date(2018, 6, 15, 10, 30, 0, 0, time.UTC)
+	require.NoError(s.T(), os.Chtimes(src, wantMtime, wantMtime))
+
+	fixedExifDate := time.Date(2018, 6, 15, 10, 30, 0, 0, time.UTC)
+	svc := new(MockExifService)
+	svc.On("ExtractDate", src, false, false).Return(fixedExifDate, "DateTimeOriginal", nil)
+
+	_, err := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(src)
+	s.NoError(err)
+
+	dst := filepath.Join(outDir, "2018", "06", "photo.jpg")
+	info, statErr := os.Lstat(dst)
+	require.NoError(s.T(), statErr)
+	s.WithinDuration(wantMtime, info.ModTime(), time.Second)
+	svc.AssertExpectations(s.T())
+}
+
 func (s *AppTestSuite) TestProcessFile_UseFileModifyDate_PassedToService() {
 	src := s.writeFile("photo.jpg", "data")
 	outDir := filepath.Join(s.tmpDir, "output")
@@ -347,6 +370,117 @@ func TestCopyFile_MissingSource(t *testing.T) {
 	tmp := t.TempDir()
 	err := copyFile(filepath.Join(tmp, "nonexistent.jpg"), filepath.Join(tmp, "dst.jpg"))
 	assert.Error(t, err)
+}
+
+// TestCopyFile_SourceModTimeUnchanged guards against accidentally mutating the source during copy.
+func TestCopyFile_SourceModTimeUnchanged(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.jpg")
+	require.NoError(t, os.WriteFile(src, []byte("data"), 0644))
+
+	wantMtime := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(src, wantMtime, wantMtime))
+
+	require.NoError(t, copyFile(src, filepath.Join(tmp, "dst.jpg")))
+
+	info, err := os.Lstat(src)
+	require.NoError(t, err)
+	assert.WithinDuration(t, wantMtime, info.ModTime(), time.Second, "source mtime must not be altered by copyFile")
+}
+
+// TestPreserveTimestamps_MissingSource verifies that a non-existent source returns an error.
+func TestPreserveTimestamps_MissingSource(t *testing.T) {
+	tmp := t.TempDir()
+	dst := filepath.Join(tmp, "dst.jpg")
+	require.NoError(t, os.WriteFile(dst, []byte("x"), 0644))
+
+	err := preserveTimestamps("/nonexistent/path/file.jpg", dst)
+	assert.Error(t, err)
+}
+
+func TestCopyFile_PreservesModTime(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.jpg")
+	dst := filepath.Join(tmp, "dst.jpg")
+	require.NoError(t, os.WriteFile(src, []byte("media data"), 0644))
+
+	wantMtime := time.Date(2018, 6, 15, 10, 30, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(src, wantMtime, wantMtime))
+
+	require.NoError(t, copyFile(src, dst))
+
+	info, err := os.Lstat(dst)
+	require.NoError(t, err)
+	// Allow 1 s of rounding on filesystems with coarser timestamp precision.
+	assert.WithinDuration(t, wantMtime, info.ModTime(), time.Second)
+}
+
+// ---- isRclonePath / isSFTPPath / toRcloneSFTPPath ----
+
+func TestIsSFTPPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"root@192.168.0.83:/mnt/photos", true},
+		{"user@host:path", true},
+		{"remotename:/path", false},  // rclone remote, no @
+		{"/local/path", false},       // plain local
+		{"C:\\Windows\\path", false}, // Windows-style local
+		{"@missinguser:path", false}, // @ at index 0
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, isSFTPPath(tc.in))
+		})
+	}
+}
+
+func TestToRcloneSFTPPath(t *testing.T) {
+	cases := []struct {
+		in      string
+		keyFile string
+		want    string
+	}{
+		{
+			"root@192.168.0.83:/mnt/naspool/photo", "",
+			":sftp,host=192.168.0.83,user=root:/mnt/naspool/photo",
+		},
+		{
+			"alice@nas:backup", "",
+			":sftp,host=nas,user=alice:backup",
+		},
+		{
+			"root@192.168.0.83:/mnt/photos", "/home/user/.ssh/id_ed25519",
+			":sftp,host=192.168.0.83,user=root,key_file=/home/user/.ssh/id_ed25519:/mnt/photos",
+		},
+		// non-SFTP paths are returned unchanged
+		{"remotename:/path", "", "remotename:/path"},
+		{"/local/path", "", "/local/path"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, toRcloneSFTPPath(tc.in, tc.keyFile))
+		})
+	}
+}
+
+func TestIsRclonePath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"myremote:/photos", true},              // standard rclone remote
+		{"root@192.168.0.83:/mnt/p", true},     // SSH-style → treated as rclone SFTP
+		{"user@host:path", true},               // SSH-style without leading /
+		{"/local/path", false},                 // plain local
+		{"relative/path", false},               // no colon
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, isRclonePath(tc.in))
+		})
+	}
 }
 
 // ---- assertion helpers ----

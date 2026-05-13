@@ -58,12 +58,21 @@ func TestNewConfig_RemoteOutput(t *testing.T) {
 	assert.Equal(t, "myremote:/remote/path", cfg.OutputPath)
 }
 
-func TestNewConfig_SSHPathNotRemote(t *testing.T) {
-	// Legacy user@host:/path syntax is no longer treated as remote; users must configure an rclone remote.
+func TestNewConfig_SSHPathIsRemote(t *testing.T) {
+	// user@host:/path is auto-converted to rclone SFTP on-the-fly syntax and treated as remote.
 	resetFlags(t, []string{"-i", "/input", "-o", "user@host:/remote/path"})
 	cfg := NewConfig()
 
-	assert.False(t, cfg.IsRemote)
+	assert.True(t, cfg.IsRemote)
+	assert.Equal(t, ":sftp,host=host,user=user:/remote/path", cfg.OutputPath)
+}
+
+func TestNewConfig_SSHKeyEmbeddedInOutputPath(t *testing.T) {
+	resetFlags(t, []string{"-i", "/input", "-o", "user@host:/remote/path", "-ssh-key", "/home/user/.ssh/id_ed25519"})
+	cfg := NewConfig()
+
+	assert.True(t, cfg.IsRemote)
+	assert.Equal(t, ":sftp,host=host,user=user,key_file=/home/user/.ssh/id_ed25519:/remote/path", cfg.OutputPath)
 }
 
 func TestNewConfig_LocalOutputNotRemote(t *testing.T) {

@@ -44,6 +44,8 @@ type Config struct {
 	OnlyDateTimeOriginal bool
 	UseFileModifyDate    bool
 	IsRemote             bool
+	FailureLog           string
+	SSHKey               string
 }
 
 // ExifService is the interface for extracting dates from media files.
@@ -100,15 +102,65 @@ func (s *Stats) print(total, skipped int) {
 
 // App represents the application state, including configuration and services.
 type App struct {
-	Config      *Config
-	ExifService ExifService
-	dirCache    sync.Map // caches local directories already created; avoids redundant MkdirAll calls
-	stats       Stats
+	Config         *Config
+	ExifService    ExifService
+	dirCache       sync.Map // caches local directories already created; avoids redundant MkdirAll calls
+	stats          Stats
+	failureLog     *FailureLogger
+	failureLogPath string
 }
 
-// isRclonePath returns true when p uses rclone remote syntax (remotename:path).
-// Local paths (no colon) and legacy SSH destinations (user@host:/path) are excluded.
+// isSFTPPath returns true for SSH-style user@host:path notation.
+func isSFTPPath(p string) bool {
+	atIdx := strings.IndexByte(p, '@')
+	if atIdx <= 0 {
+		return false
+	}
+	return strings.ContainsRune(p[atIdx:], ':')
+}
+
+// toRcloneSFTPPath converts user@host:/path to rclone on-the-fly SFTP syntax.
+// e.g. root@192.168.0.83:/mnt/photos → :sftp,host=192.168.0.83,user=root:/mnt/photos
+// If keyFile is non-empty, key_file=<path> is appended to the options.
+// Non-SFTP paths are returned unchanged.
+func toRcloneSFTPPath(p, keyFile string) string {
+	atIdx := strings.IndexByte(p, '@')
+	if atIdx <= 0 {
+		return p
+	}
+	rest := p[atIdx+1:]
+	colonIdx := strings.IndexByte(rest, ':')
+	if colonIdx < 0 {
+		return p
+	}
+	user := p[:atIdx]
+	host := rest[:colonIdx]
+	path := rest[colonIdx+1:]
+	opts := fmt.Sprintf("host=%s,user=%s", host, user)
+	if keyFile != "" {
+		opts += ",key_file=" + keyFile
+	}
+	return fmt.Sprintf(":sftp,%s:%s", opts, path)
+}
+
+// expandTilde replaces a leading ~ with the current user's home directory.
+func expandTilde(p string) (string, error) {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p, err
+	}
+	return filepath.Join(home, p[1:]), nil
+}
+
+// isRclonePath returns true when p uses rclone remote syntax (remotename:path)
+// or SSH-style user@host:/path (which is converted to rclone SFTP on-the-fly syntax).
 func isRclonePath(p string) bool {
+	if isSFTPPath(p) {
+		return true
+	}
 	idx := strings.IndexByte(p, ':')
 	return idx > 0 && !strings.ContainsRune(p[:idx], '@')
 }
@@ -125,6 +177,8 @@ func NewConfig() *Config {
 	flag.BoolVar(&config.DryRun, "dry-run", false, "Show what would be done, without moving/copying files")
 	flag.BoolVar(&config.OnlyDateTimeOriginal, "only-datetimeoriginal", false, "Only process files with DateTimeOriginal tag")
 	flag.BoolVar(&config.UseFileModifyDate, "use-file-modify-date", false, "Use file modify date as a fallback")
+	flag.StringVar(&config.FailureLog, "failure-log", "", `Write failed-file records as NDJSON to this path ("auto" = timestamp-based filename)`)
+	flag.StringVar(&config.SSHKey, "ssh-key", "", "Path to SSH private key for user@host:/path destinations (e.g. ~/.ssh/id_ed25519)")
 	// Use custom usage/help function
 	flag.Usage = showHelp
 
@@ -138,7 +192,15 @@ func NewConfig() *Config {
 
 	flag.Parse()
 
+	if config.SSHKey != "" {
+		if expanded, err := expandTilde(config.SSHKey); err == nil {
+			config.SSHKey = expanded
+		}
+	}
 	config.IsRemote = isRclonePath(config.OutputPath)
+	if isSFTPPath(config.OutputPath) {
+		config.OutputPath = toRcloneSFTPPath(config.OutputPath, config.SSHKey)
+	}
 
 	return config
 }
@@ -187,6 +249,25 @@ func main() {
 		ExifService: pool,
 	}
 
+	if config.FailureLog != "" {
+		logPath := config.FailureLog
+		if logPath == "auto" {
+			logPath = FailureLogPath(time.Now())
+		}
+		fl, err := NewFailureLogger(logPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Warning: could not open failure log:", err)
+		} else {
+			app.failureLog = fl
+			app.failureLogPath = logPath
+			defer func() {
+				if err := fl.Close(); err != nil {
+					logrus.Warnf("closing failure log: %v", err)
+				}
+			}()
+		}
+	}
+
 	app.Run()
 }
 
@@ -222,12 +303,12 @@ func validatePaths(config *Config) error {
 func showHelp() {
 	fmt.Fprintf(os.Stderr, `Usage: %s [OPTIONS]
 
-Organize media files by date (YYYY/MM) using EXIF data, with optional remote rsync transfer.
+Organize media files by date (YYYY/MM) using EXIF data, with optional remote transfer via rclone.
 
 Required:
 	-i <dir>        Input directory
-	-o <dir|dest>   Output: local directory or
-							rclone remote destination formatted as remotename:path (e.g. mysftp:/photos)
+	-o <dir|dest>   Output: local directory, rclone remote (remotename:path),
+	                or SSH destination (user@host:/path — auto-converted to rclone SFTP)
 
 Options:
 `, os.Args[0])
@@ -235,9 +316,11 @@ Options:
 	fmt.Fprintf(os.Stderr, `
 Examples:
 	%s -i /path/to/input -o /path/to/output
-	%s -i /path/to/input -o user@host:/remote/path --copy
-	%s -i /path/to/input -o /path/to/output --dry-run
-`, os.Args[0], os.Args[0], os.Args[0])
+	%s -i /path/to/input -o myremote:/photos -copy
+	%s -i /path/to/input -o root@192.168.1.10:/mnt/nas/photos -ssh-key ~/.ssh/id_ed25519
+	%s -i /path/to/input -o /path/to/output -dry-run
+	%s -i /path/to/input -o /path/to/output -failure-log auto
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 }
 
 // Run starts the file organization process.
@@ -278,6 +361,9 @@ func (app *App) Run() {
 	logrus.Infof("Processing finished. Total files: %d, Elapsed time: %s", total, elapsed)
 
 	app.stats.print(total, skipped)
+	if app.failureLogPath != "" {
+		fmt.Printf("  Failure log: %s\n", app.failureLogPath)
+	}
 }
 
 // collectFiles walks the input directory and returns media file paths, a media count, and a skipped-non-media count.
@@ -321,10 +407,30 @@ func (app *App) worker(id int, jobs <-chan string, wg *sync.WaitGroup, bar *prog
 		if app.Config.Debug {
 			logrus.Debugf("Worker %d handling %s", id, path)
 		}
+		start := time.Now()
 		reason, err := app.processFile(path)
+		elapsed := time.Since(start)
 		if err != nil {
 			logrus.Errorf("Failed processing %s: %v", path, err)
 			app.stats.addFailure(reason)
+			if app.failureLog != nil {
+				var sizeBytes int64
+				if fi, statErr := os.Lstat(path); statErr == nil {
+					sizeBytes = fi.Size()
+				}
+				rec := FailureRecord{
+					Timestamp:  time.Now().UTC().Format(time.RFC3339),
+					Path:       path,
+					Filename:   filepath.Base(path),
+					SizeBytes:  sizeBytes,
+					Reason:     reason,
+					Error:      err.Error(),
+					DurationMs: elapsed.Milliseconds(),
+				}
+				if writeErr := app.failureLog.Write(rec); writeErr != nil {
+					logrus.Warnf("failure log write error: %v", writeErr)
+				}
+			}
 		} else {
 			app.stats.addSuccess()
 		}
@@ -495,5 +601,14 @@ func copyFile(src, dst string) error {
 		}
 		return syncErr
 	}
-	return closeErr
+	if closeErr != nil {
+		return closeErr
+	}
+
+	// Restore original timestamps. Failure is non-fatal: some destination filesystems
+	// (e.g. SMB shares) may not support birth-time writes, but the data copy succeeded.
+	if err := preserveTimestamps(src, dst); err != nil {
+		logrus.Warnf("preserving timestamps on %s: %v", dst, err)
+	}
+	return nil
 }
