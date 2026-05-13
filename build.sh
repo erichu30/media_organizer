@@ -10,4 +10,4 @@ if ! command -v go &> /dev/null; then
   gvm use go1.25.0
 fi
 
-go build -o ./build/sort_by_date src/cmd/sort_by_date.go
+go build -o ./build/sort_by_date ./src/cmd/
