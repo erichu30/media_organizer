@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -154,7 +159,7 @@ func (s *AppTestSuite) TestProcessFile_LocalMove() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	_, err := s.appWith(&Config{OutputPath: outDir}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir}, svc).processFile(context.Background(), src)
 
 	s.NoError(err)
 	s.noFile(src, "source should be removed after move")
@@ -170,7 +175,7 @@ func (s *AppTestSuite) TestProcessFile_LocalCopy() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	_, err := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(context.Background(), src)
 
 	s.NoError(err)
 	s.hasFile(src)
@@ -186,7 +191,7 @@ func (s *AppTestSuite) TestProcessFile_DryRun_NoChanges() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	_, err := s.appWith(&Config{OutputPath: outDir, DryRun: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, DryRun: true}, svc).processFile(context.Background(), src)
 
 	s.NoError(err)
 	s.hasFile(src)
@@ -203,7 +208,7 @@ func (s *AppTestSuite) TestProcessFile_DateFolderStructure() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	_, processErr := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(src)
+	_, processErr := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(context.Background(), src)
 	s.NoError(processErr)
 
 	s.hasFile(filepath.Join(outDir, "2001", "09", "img.jpg"))
@@ -215,7 +220,7 @@ func (s *AppTestSuite) TestProcessFile_NoDate_ReturnsError() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(time.Time{}, "", nil)
 
-	_, err := s.appWith(&Config{OutputPath: s.tmpDir}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: s.tmpDir}, svc).processFile(context.Background(), src)
 
 	s.Error(err)
 	svc.AssertExpectations(s.T())
@@ -227,7 +232,7 @@ func (s *AppTestSuite) TestProcessFile_ExifError_ReturnsError() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(time.Time{}, "", assert.AnError)
 
-	_, err := s.appWith(&Config{OutputPath: s.tmpDir}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: s.tmpDir}, svc).processFile(context.Background(), src)
 
 	s.Error(err)
 	svc.AssertExpectations(s.T())
@@ -241,7 +246,7 @@ func (s *AppTestSuite) TestProcessFile_OnlyDateTimeOriginal_SkipsCreateDate() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "CreateDate", nil)
 
-	_, err := s.appWith(&Config{OutputPath: outDir, OnlyDateTimeOriginal: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, OnlyDateTimeOriginal: true}, svc).processFile(context.Background(), src)
 
 	s.Error(err)
 	s.hasFile(src)
@@ -256,7 +261,7 @@ func (s *AppTestSuite) TestProcessFile_OnlyDateTimeOriginal_AllowsDateTimeOrigin
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
 
-	_, err := s.appWith(&Config{OutputPath: outDir, OnlyDateTimeOriginal: true, CopyMode: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, OnlyDateTimeOriginal: true, CopyMode: true}, svc).processFile(context.Background(), src)
 
 	s.NoError(err)
 	svc.AssertExpectations(s.T())
@@ -275,7 +280,7 @@ func (s *AppTestSuite) TestProcessFile_CopyPreservesModTime() {
 	svc := new(MockExifService)
 	svc.On("ExtractDate", src, false, false).Return(fixedExifDate, "DateTimeOriginal", nil)
 
-	_, err := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, CopyMode: true}, svc).processFile(context.Background(), src)
 	s.NoError(err)
 
 	dst := filepath.Join(outDir, "2018", "06", "photo.jpg")
@@ -294,10 +299,138 @@ func (s *AppTestSuite) TestProcessFile_UseFileModifyDate_PassedToService() {
 	// UseFileModifyDate=true must be forwarded as the third arg
 	svc.On("ExtractDate", src, false, true).Return(fixedTime, "FileModifyDate", nil)
 
-	_, err := s.appWith(&Config{OutputPath: outDir, UseFileModifyDate: true, CopyMode: true}, svc).processFile(src)
+	_, err := s.appWith(&Config{OutputPath: outDir, UseFileModifyDate: true, CopyMode: true}, svc).processFile(context.Background(), src)
 
 	s.NoError(err)
 	svc.AssertExpectations(s.T())
+}
+
+// ---- copyFile ----
+
+// ---- processFile: signal recovery ----
+
+// TestProcessFile_EXDEV_SourcePreservedOnCancel simulates the cross-device move path
+// (copy+delete fallback). When the context is cancelled AFTER the copy succeeds but
+// BEFORE os.Remove runs, the source must still exist — no data loss.
+func (s *AppTestSuite) TestProcessFile_EXDEV_SourcePreservedOnCancel() {
+	src := s.writeFile("photo.jpg", "important-data")
+	outDir := filepath.Join(s.tmpDir, "output")
+
+	fixedTime := time.Date(2023, 5, 15, 12, 0, 0, 0, time.UTC)
+	svc := new(MockExifService)
+	svc.On("ExtractDate", src, false, false).Return(fixedTime, "DateTimeOriginal", nil)
+
+	// Pre-cancelled context: transferLocal sees ctx.Err() != nil before os.Remove.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	app := s.appWith(&Config{OutputPath: outDir}, svc)
+
+	// Inject a fake EXDEV error so the copy+delete branch is exercised without
+	// needing two real filesystems.
+	origRename := osRename
+	defer func() { osRename = origRename }()
+	osRename = func(src, dst string) error {
+		return &os.LinkError{Op: "rename", Old: src, New: dst, Err: syscall.EXDEV}
+	}
+
+	_, err := app.processFile(ctx, src)
+
+	// No error — file was copied successfully; source skip is non-fatal.
+	s.NoError(err)
+	// Source must still exist (delete was skipped due to cancellation).
+	s.hasFile(src)
+	// Destination must also exist (copy completed before cancellation check).
+	s.hasFile(filepath.Join(outDir, "2023", "05", "photo.jpg"))
+}
+
+// ---- Run: signal / context cancellation ----
+
+// TestRun_CancelledContext_StopsFeeder verifies that Run returns interrupted=true
+// when the context is already cancelled before the run begins.
+// Workers always finish their in-progress file — we only stop feeding new ones.
+func (s *AppTestSuite) TestRun_CancelledContext_StopsFeeder() {
+	// Create enough files that at least some won't be fed before ctx is checked.
+	for i := range 10 {
+		s.writeFile(fmt.Sprintf("photo%02d.jpg", i), "data")
+	}
+	outDir := filepath.Join(s.tmpDir, "output")
+
+	fixedTime := time.Date(2023, 5, 15, 12, 0, 0, 0, time.UTC)
+	svc := new(MockExifService)
+	svc.On("ExtractDate", mock.AnythingOfType("string"), false, false).
+		Return(fixedTime, "DateTimeOriginal", nil).Maybe()
+
+	// Buffer=0: unbuffered channel — feeder must block on each send until a worker
+	// receives. With context already cancelled, ctx.Done() wins the select race
+	// before the second send, guaranteeing interrupted=true.
+	app := s.appWith(&Config{
+		InputPath:  s.tmpDir,
+		OutputPath: outDir,
+		Workers:    1,
+		Buffer:     0,
+	}, svc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	interrupted := app.Run(ctx)
+
+	s.True(interrupted, "Run must return true when context is cancelled")
+}
+
+// TestRun_FullContext_NotInterrupted verifies that Run returns false when the
+// context is never cancelled and all files are processed normally.
+func (s *AppTestSuite) TestRun_FullContext_NotInterrupted() {
+	s.writeFile("photo.jpg", "data")
+	outDir := filepath.Join(s.tmpDir, "output")
+
+	fixedTime := time.Date(2023, 5, 15, 12, 0, 0, 0, time.UTC)
+	svc := new(MockExifService)
+	svc.On("ExtractDate", mock.AnythingOfType("string"), false, false).
+		Return(fixedTime, "DateTimeOriginal", nil)
+
+	app := s.appWith(&Config{
+		InputPath:  s.tmpDir,
+		OutputPath: outDir,
+		Workers:    1,
+		Buffer:     10,
+	}, svc)
+
+	interrupted := app.Run(context.Background())
+
+	s.False(interrupted, "Run must return false when context is never cancelled")
+	svc.AssertExpectations(s.T())
+}
+
+// ---- Stats.print: interrupted notice ----
+
+// TestStatsPrint_InterruptedNotice verifies the interrupted warning line appears
+// when interrupted=true and is absent when interrupted=false.
+func TestStatsPrint_InterruptedNotice(t *testing.T) {
+	captureStdout := func(fn func()) string {
+		r, w, _ := os.Pipe()
+		old := os.Stdout
+		os.Stdout = w
+		fn()
+		w.Close()
+		os.Stdout = old
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		return buf.String()
+	}
+
+	t.Run("interrupted=true shows warning", func(t *testing.T) {
+		var s Stats
+		out := captureStdout(func() { s.print(10, 0, true) })
+		assert.True(t, strings.Contains(out, "interrupted"), "summary must mention interrupted")
+	})
+
+	t.Run("interrupted=false no warning", func(t *testing.T) {
+		var s Stats
+		out := captureStdout(func() { s.print(10, 0, false) })
+		assert.False(t, strings.Contains(out, "interrupted"), "normal summary must not mention interrupted")
+	})
 }
 
 // ---- copyFile ----
@@ -413,6 +546,61 @@ func TestCopyFile_PreservesModTime(t *testing.T) {
 	require.NoError(t, err)
 	// Allow 1 s of rounding on filesystems with coarser timestamp precision.
 	assert.WithinDuration(t, wantMtime, info.ModTime(), time.Second)
+}
+
+// ---- circuit breaker / remote failure counter ----
+
+func TestRecordRemoteFailure_FiresAtThreshold(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	app := &App{
+		Config:    &Config{RemoteFailThreshold: 3},
+		runCancel: cancel,
+	}
+
+	assert.False(t, app.recordRemoteFailure()) // 1 — below threshold
+	assert.False(t, app.recordRemoteFailure()) // 2 — below threshold
+	assert.True(t, app.recordRemoteFailure())  // 3 — fires
+	assert.Equal(t, context.Canceled, ctx.Err(), "circuit breaker must cancel the run context")
+}
+
+func TestRecordRemoteFailure_ResetOnSuccess(t *testing.T) {
+	app := &App{Config: &Config{RemoteFailThreshold: 3}}
+
+	app.recordRemoteFailure() // 1
+	app.recordRemoteFailure() // 2
+	app.resetRemoteFailures() // reset — next failure starts from 1 again
+	assert.False(t, app.recordRemoteFailure()) // 1, not 3
+}
+
+func TestRecordRemoteFailure_DisabledWhenZero(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	app := &App{
+		Config:    &Config{RemoteFailThreshold: 0},
+		runCancel: cancel,
+	}
+
+	for range 100 {
+		assert.False(t, app.recordRemoteFailure())
+	}
+	assert.NoError(t, ctx.Err(), "context must not be cancelled when threshold is 0")
+}
+
+func TestRecordRemoteFailure_SubsequentCallsAfterFire(t *testing.T) {
+	cancelled := false
+	app := &App{
+		Config:    &Config{RemoteFailThreshold: 2},
+		runCancel: func() { cancelled = true },
+	}
+
+	app.recordRemoteFailure() // 1
+	app.recordRemoteFailure() // 2 — fires
+	assert.True(t, cancelled)
+	// Additional failures after the breaker has fired must not panic.
+	assert.True(t, app.recordRemoteFailure()) // 3 — still returns true, no panic
 }
 
 // ---- isRclonePath / isSFTPPath / toRcloneSFTPPath ----

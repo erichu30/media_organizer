@@ -11,10 +11,11 @@ A command-line tool to organize media files (photos and videos) into a directory
 - **Concurrent Processing**: Uses a worker pool to process files in parallel, significantly speeding up the process for large collections.
 - **Flexible Operation**: Supports both moving and copying files.
 - **Dry-Run Mode**: Preview the results without making any changes to your files.
-- **Remote Sync**: Transfer files to a remote server using `rclone` (supports S3, SFTP, Dropbox, and 40+ backends). Accepts both rclone remote syntax (`remotename:path`) and SSH shorthand (`user@host:/path`).
+- **Remote Sync**: Transfer files to a remote server using `rclone` (supports S3, SFTP, Dropbox, and 40+ backends). Accepts both rclone remote syntax (`remotename:path`) and SSH shorthand (`user@host:/path`). Configurable retry count and circuit breaker for resilience against SSH disconnects.
 - **Timestamp Preservation**: When copying, the destination file retains the original `FileModifyDate`, `FileAccessDate`, and (on macOS) `FileCreatedDate` — EXIF file metadata is unchanged.
 - **Run Summary**: Prints a brief summary to stdout after processing — total processed, success count, and failed count broken down by reason.
 - **Structured Failure Log**: Optionally writes one NDJSON record per failed file (`-failure-log auto` or `-failure-log <path>`), including path, size, reason, error, and duration.
+- **Signal Handling**: Responds to `SIGINT` (Ctrl-C), `SIGTERM`, and `SIGHUP` with a graceful shutdown — in-progress file operations finish before exit, all buffers are flushed, and the summary is printed with a partial-results warning. A second signal force-quits immediately.
 - **Logging**: Keeps a log of all operations in `sortbydate.log`.
 
 ## Dependencies
@@ -91,6 +92,10 @@ Options:
     	Write failed-file records as NDJSON to this path ("auto" = timestamp-based filename)
   -only-datetimeoriginal
     	Only process files with DateTimeOriginal tag
+  -retries int
+    	rclone retry count for transient remote errors — SSH disconnect, timeouts (default 3)
+  -remote-fail-threshold int
+    	abort after this many consecutive remote failures; 0 to disable (default 5)
   -ssh-key string
     	Path to SSH private key for user@host:/path destinations (e.g. ~/.ssh/id_ed25519)
   -use-file-modify-date
@@ -174,6 +179,63 @@ When a file is **copied** (`-copy` flag, or a move that falls back to copy+delet
 > **Note:** If the destination filesystem does not support writing birth time (e.g., some SMB or NFS shares), the tool logs a warning and the copy still succeeds. The `FileModifyDate` is always restored even if birth time cannot be.
 
 **Move operations** (`os.Rename`) are atomic within the same filesystem and never alter timestamps. The copy+delete fallback (used when source and destination are on different filesystems) applies the same timestamp preservation.
+
+## Remote Transfer Resilience (SSH Disconnect)
+
+Three layers protect against transient or sustained SSH disconnects:
+
+### 1. Automatic retry (`-retries`)
+
+Passed directly to rclone as `--retries N`. On a brief SSH blip, rclone retries the transfer internally before reporting failure. Default is 3; increase for flaky links:
+
+```bash
+./build/sort_by_date -i /input -o root@nas:/photos -ssh-key ~/.ssh/id_ed25519 -retries 10
+```
+
+### 2. Partial-file cleanup
+
+On **any** rclone failure (SSH disconnect, timeout, signal), a `rclone deletefile` is issued for the destination path using a fresh 30-second context. This ensures re-runs do not encounter stale partial files. The cleanup itself uses `--retries 1` to fail fast (if SSH is down, retrying the cleanup won't help). The local source file is always preserved — rclone only removes it after a fully successful `moveto`.
+
+### 3. Circuit breaker (`-remote-fail-threshold`)
+
+When consecutive remote failures reach the threshold, the circuit breaker fires:
+- Cancels the run context → feeder stops dispatching new work
+- Prints a clear message to stderr and the log
+- Workers finish their current file, then the summary is printed
+
+```
+Circuit breaker: 5 consecutive remote failures — aborting remaining transfers
+```
+
+Use `-remote-fail-threshold 0` to disable and let all files be attempted regardless.
+
+**Source files are never lost** regardless of which layer intervenes — the tool never deletes a local source until a remote transfer is confirmed fully successful.
+
+## Signal Handling
+
+The tool handles `SIGINT` (Ctrl-C), `SIGTERM`, and `SIGHUP` gracefully:
+
+1. **Feeder stops** — no new files are dispatched to workers
+2. **Workers finish current file** — in-progress operations complete their current step before exiting
+3. **Recovery per operation type:**
+   - `os.Rename` — atomic; no recovery needed
+   - Cross-device move (copy+delete fallback): if a signal arrives after the copy but before the source delete, the delete is skipped — both source and destination exist; source is the safety net
+   - `rclone moveto/copyto` — subprocess is killed immediately; a best-effort `rclone deletefile` removes any partial remote file (source is always intact — rclone never deletes local source until transfer fully succeeds)
+4. **Buffers flushed** — the failure log is flushed and closed before exit
+5. **Partial summary printed** — the summary includes a `WARNING: interrupted` notice
+
+```
+--- Summary ---
+  WARNING: interrupted — results below are partial
+  Processed : 142
+  Success   : 87
+  Failed    : 2
+    no EXIF date:                    2
+```
+
+Exit code is `1` when interrupted, `0` on a complete run.
+
+A **second signal** (e.g. two Ctrl-C presses) reverts to default OS behaviour and terminates the process immediately.
 
 ## Logging
 

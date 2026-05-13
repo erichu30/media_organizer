@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -156,7 +157,7 @@ func (s *AppTestSuite) TestWorker_WritesFailureRecord() {
 	app.failureLog = fl
 	app.failureLogPath = logPath
 
-	_, err = app.processFile(src)
+	_, err = app.processFile(context.Background(), src)
 	s.Error(err)
 
 	// Simulate what worker does after processFile returns an error

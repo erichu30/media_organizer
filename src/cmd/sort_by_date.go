@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,8 +19,10 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,6 +49,8 @@ type Config struct {
 	IsRemote             bool
 	FailureLog           string
 	SSHKey               string
+	Retries              int // rclone --retries value; 0 lets rclone use its own default
+	RemoteFailThreshold  int // circuit-breaker: abort after this many consecutive remote failures (0 = disabled)
 }
 
 // ExifService is the interface for extracting dates from media files.
@@ -72,7 +77,7 @@ func (s *Stats) addFailure(reason string) {
 	s.failed[reason]++
 }
 
-func (s *Stats) print(total, skipped int) {
+func (s *Stats) print(total, skipped int, interrupted bool) {
 	s.mu.Lock()
 	reasons := make([]string, 0, len(s.failed))
 	counts := make(map[string]int64, len(s.failed))
@@ -89,6 +94,9 @@ func (s *Stats) print(total, skipped int) {
 	}
 
 	fmt.Printf("\n--- Summary ---\n")
+	if interrupted {
+		fmt.Printf("  WARNING: interrupted — results below are partial\n")
+	}
 	fmt.Printf("  Processed : %d\n", total)
 	fmt.Printf("  Success   : %d\n", s.success.Load())
 	fmt.Printf("  Failed    : %d\n", totalFailed)
@@ -102,12 +110,14 @@ func (s *Stats) print(total, skipped int) {
 
 // App represents the application state, including configuration and services.
 type App struct {
-	Config         *Config
-	ExifService    ExifService
-	dirCache       sync.Map // caches local directories already created; avoids redundant MkdirAll calls
-	stats          Stats
-	failureLog     *FailureLogger
-	failureLogPath string
+	Config              *Config
+	ExifService         ExifService
+	dirCache            sync.Map // caches local directories already created; avoids redundant MkdirAll calls
+	stats               Stats
+	failureLog          *FailureLogger
+	failureLogPath      string
+	consRemoteFailures  atomic.Int64    // consecutive remote-transfer failures; reset to 0 on success
+	runCancel           context.CancelFunc // cancels the run-level context; set in Run before workers start
 }
 
 // isSFTPPath returns true for SSH-style user@host:path notation.
@@ -179,6 +189,8 @@ func NewConfig() *Config {
 	flag.BoolVar(&config.UseFileModifyDate, "use-file-modify-date", false, "Use file modify date as a fallback")
 	flag.StringVar(&config.FailureLog, "failure-log", "", `Write failed-file records as NDJSON to this path ("auto" = timestamp-based filename)`)
 	flag.StringVar(&config.SSHKey, "ssh-key", "", "Path to SSH private key for user@host:/path destinations (e.g. ~/.ssh/id_ed25519)")
+	flag.IntVar(&config.Retries, "retries", 3, "rclone retry count for transient remote errors (SSH disconnect, timeouts)")
+	flag.IntVar(&config.RemoteFailThreshold, "remote-fail-threshold", 5, "abort after this many consecutive remote failures, 0 to disable")
 	// Use custom usage/help function
 	flag.Usage = showHelp
 
@@ -225,7 +237,27 @@ func setupLogging(debug bool) {
 	}
 }
 
+// main is a thin wrapper so that deferred cleanup in run() executes before the
+// process exits. os.Exit skips defers; keeping all logic in run() avoids leaks.
 func main() {
+	os.Exit(run())
+}
+
+// run contains the real entry-point logic and returns an OS exit code:
+// 0 on success, 1 on error or when the run is interrupted by a signal.
+// All deferred cleanup (pool, failure log) runs before the exit code is returned.
+func run() int {
+	// Cancel the context when SIGINT, SIGTERM, or SIGHUP arrives.
+	// After the first signal the handler is unregistered, so a second signal
+	// (e.g. two Ctrl-C presses) terminates the process immediately — the
+	// expected "force-quit" behaviour.
+	ctx, stop := signal.NotifyContext(context.Background(),
+		os.Interrupt,   // SIGINT  (Ctrl-C)
+		syscall.SIGTERM, // graceful shutdown from init/systemd/docker stop
+		syscall.SIGHUP,  // terminal closed / daemon reload
+	)
+	defer stop() // release signal resources; also re-enables default signal behaviour
+
 	config := NewConfig()
 	if config.InputPath == "" || config.OutputPath == "" {
 		logrus.Fatal("Input (-i) and output (-o) directories are required")
@@ -242,7 +274,7 @@ func main() {
 	if err != nil {
 		logrus.Fatalf("Failed to initialize ExifToolPool: %v", err)
 	}
-	defer pool.Close()
+	defer pool.Close() // always reached; shuts down exiftool subprocess pool
 
 	app := &App{
 		Config:      config,
@@ -261,6 +293,8 @@ func main() {
 			app.failureLog = fl
 			app.failureLogPath = logPath
 			defer func() {
+				// Flush the 64 KiB buffer and sync to disk even on interrupt,
+				// so partial failure records are not lost.
 				if err := fl.Close(); err != nil {
 					logrus.Warnf("closing failure log: %v", err)
 				}
@@ -268,7 +302,10 @@ func main() {
 		}
 	}
 
-	app.Run()
+	if app.Run(ctx) {
+		return 1
+	}
+	return 0
 }
 
 // validatePaths ensures the input and output directories are correctly set up.
@@ -323,9 +360,18 @@ Examples:
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 }
 
-// Run starts the file organization process.
-func (app *App) Run() {
+// Run starts the file organization process and returns true if the run was
+// cut short — either by a signal or by the circuit breaker.
+// Workers always finish their current file before exiting — no partial writes.
+func (app *App) Run(ctx context.Context) (interrupted bool) {
 	startTime := time.Now()
+
+	// Wrap with a child context so the circuit breaker can abort the run
+	// independently of the parent signal context. Both signal and circuit
+	// breaker cancel runCtx, which stops the feeder and sets interrupted=true.
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	app.runCancel = runCancel // stored so transferRemote can call it
 
 	// Step 1: Walk the input directory to count files and collect paths.
 	paths, total, skipped := app.collectFiles()
@@ -345,25 +391,41 @@ func (app *App) Run() {
 
 	for w := 1; w <= app.Config.Workers; w++ {
 		wg.Add(1)
-		go app.worker(w, jobs, &wg, bar)
+		go app.worker(runCtx, w, jobs, &wg, bar)
 	}
 
-	// Step 3: Push file paths to the jobs channel.
+	// Step 3: Feed file paths into the jobs channel.
+	// On signal or circuit-breaker abort, stop feeding; workers drain the
+	// channel, finish their current file, then exit when the channel is closed.
+	// Closing jobs here (not inside the select) guarantees exactly one close.
+feederLoop:
 	for _, path := range paths {
-		jobs <- path
+		select {
+		case jobs <- path:
+		case <-runCtx.Done():
+			interrupted = true
+			break feederLoop
+		}
 	}
 	close(jobs)
 
-	// Step 4: Wait for all workers to finish.
+	// Step 4: Wait for all in-flight workers to finish their current file.
+	// This is always reached — signal only stops the feeder, not the workers.
 	wg.Wait()
 
-	elapsed := time.Since(startTime)
-	logrus.Infof("Processing finished. Total files: %d, Elapsed time: %s", total, elapsed)
+	// Clear the progress bar before printing; it may be mid-render if interrupted.
+	bar.Clear()
 
-	app.stats.print(total, skipped)
+	elapsed := time.Since(startTime)
+	logrus.Infof("Processing finished (interrupted=%v). Total files: %d, Elapsed: %s",
+		interrupted, total, elapsed)
+
+	app.stats.print(total, skipped, interrupted)
 	if app.failureLogPath != "" {
 		fmt.Printf("  Failure log: %s\n", app.failureLogPath)
 	}
+
+	return interrupted
 }
 
 // collectFiles walks the input directory and returns media file paths, a media count, and a skipped-non-media count.
@@ -401,14 +463,14 @@ func (app *App) collectFiles() ([]string, int, int) {
 }
 
 // worker is a routine that processes files from the jobs channel.
-func (app *App) worker(id int, jobs <-chan string, wg *sync.WaitGroup, bar *progressbar.ProgressBar) {
+func (app *App) worker(ctx context.Context, id int, jobs <-chan string, wg *sync.WaitGroup, bar *progressbar.ProgressBar) {
 	defer wg.Done()
 	for path := range jobs {
 		if app.Config.Debug {
 			logrus.Debugf("Worker %d handling %s", id, path)
 		}
 		start := time.Now()
-		reason, err := app.processFile(path)
+		reason, err := app.processFile(ctx, path)
 		elapsed := time.Since(start)
 		if err != nil {
 			logrus.Errorf("Failed processing %s: %v", path, err)
@@ -440,7 +502,9 @@ func (app *App) worker(id int, jobs <-chan string, wg *sync.WaitGroup, bar *prog
 
 // processFile handles the logic for a single file: extracting the date, determining the destination, and moving/copying.
 // Returns a short failure-reason string (empty on success) alongside any error.
-func (app *App) processFile(path string) (string, error) {
+// ctx is used to cancel in-progress rclone subprocesses on signal; local operations
+// complete their current step (copy or rename) before honouring cancellation.
+func (app *App) processFile(ctx context.Context, path string) (string, error) {
 	t, reason, err := app.extractDate(path)
 	if err != nil {
 		logrus.Warnf("Cannot extract date for %s: %v", path, err)
@@ -482,38 +546,129 @@ func (app *App) processFile(path string) (string, error) {
 	}
 
 	if app.Config.IsRemote {
-		subCmd := "moveto"
-		if app.Config.CopyMode {
-			subCmd = "copyto"
-		}
-		rcloneCmd := exec.Command("rclone", subCmd, path, targetPath)
-		if app.Config.Debug {
-			logrus.Debugf("Executing: %s", rcloneCmd.String())
-		}
-		if output, err := rcloneCmd.CombinedOutput(); err != nil {
-			return "file operation failed", fmt.Errorf("rclone %s %s: %w, output: %s", subCmd, path, err, string(output))
-		}
+		return app.transferRemote(ctx, path, targetPath)
+	}
+	return app.transferLocal(ctx, path, targetPath)
+}
+
+// transferRemote runs rclone moveto/copyto with retry and circuit-breaker support.
+//
+// On any failure (signal, SSH disconnect, timeout, …):
+//  1. A best-effort rclone deletefile removes any partial remote file so re-runs
+//     start clean. The local source is always intact — rclone never deletes it
+//     until the transfer fully succeeds.
+//  2. The consecutive-failure counter is incremented; if it reaches the configured
+//     threshold the circuit breaker fires, cancelling the run context so the feeder
+//     stops dispatching new work.
+//
+// On success the counter is reset to zero.
+func (app *App) transferRemote(ctx context.Context, src, dst string) (string, error) {
+	subCmd := "moveto"
+	if app.Config.CopyMode {
+		subCmd = "copyto"
+	}
+
+	args := []string{subCmd, src, dst}
+	if app.Config.Retries > 0 {
+		args = append(args, "--retries", strconv.Itoa(app.Config.Retries))
+	}
+	rcloneCmd := exec.CommandContext(ctx, "rclone", args...)
+	if app.Config.Debug {
+		logrus.Debugf("Executing: %s", rcloneCmd.String())
+	}
+
+	output, err := rcloneCmd.CombinedOutput()
+	if err == nil {
+		app.resetRemoteFailures()
+		return "", nil
+	}
+
+	// On any rclone failure, attempt to remove the partial remote file.
+	// Uses a fresh context so cleanup can run even when ctx is already cancelled
+	// (signal or circuit breaker). Best-effort: if SSH is down this also fails;
+	// the warning gives the user enough information to clean up manually.
+	logrus.Warnf("rclone %s failed for %s; attempting remote cleanup of %s", subCmd, src, dst)
+	app.cleanupRemoteFile(dst)
+
+	if ctx.Err() != nil {
+		app.recordRemoteFailure()
+		return "file operation failed", fmt.Errorf("rclone %s interrupted: %w", subCmd, ctx.Err())
+	}
+
+	app.recordRemoteFailure()
+	return "file operation failed", fmt.Errorf("rclone %s %s: %w, output: %s", subCmd, src, err, string(output))
+}
+
+// cleanupRemoteFile attempts rclone deletefile on dst using a fresh 30-second context.
+// Errors are logged as warnings — this is always best-effort.
+func (app *App) cleanupRemoteFile(dst string) {
+	cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cleanCancel()
+	// Pass --retries 1 so cleanup fails fast rather than spending time retrying
+	// (if SSH is down, retrying won't help).
+	if cleanErr := exec.CommandContext(cleanCtx, "rclone", "deletefile", "--retries", "1", dst).Run(); cleanErr != nil {
+		logrus.Warnf("remote cleanup of %s failed (manual removal may be needed): %v", dst, cleanErr)
 	} else {
-		if app.Config.CopyMode {
-			if err := copyFile(path, targetPath); err != nil {
-				return "file operation failed", err
-			}
+		logrus.Infof("remote cleanup succeeded: removed partial %s", dst)
+	}
+}
+
+// recordRemoteFailure increments the consecutive failure counter and fires the
+// circuit breaker when the threshold is reached. Safe for concurrent callers.
+// Returns true if the circuit breaker fired on this call.
+func (app *App) recordRemoteFailure() bool {
+	n := app.consRemoteFailures.Add(1)
+	threshold := int64(app.Config.RemoteFailThreshold)
+	if threshold <= 0 || n < threshold {
+		return false
+	}
+	// Fire exactly once — context cancellation is idempotent so repeated calls
+	// from other goroutines are harmless.
+	msg := fmt.Sprintf("circuit breaker: %d consecutive remote failures — aborting remaining transfers", n)
+	logrus.Error(msg)
+	fmt.Fprintf(os.Stderr, "\n%s\n", msg)
+	if app.runCancel != nil {
+		app.runCancel()
+	}
+	return true
+}
+
+// resetRemoteFailures resets the consecutive failure counter after a successful transfer.
+func (app *App) resetRemoteFailures() {
+	app.consRemoteFailures.Store(0)
+}
+
+// transferLocal moves or copies a file within the local filesystem.
+// For cross-device moves (EXDEV), it falls back to copy+delete. If a signal arrives
+// after the copy succeeds but before the source is deleted, the delete is skipped so
+// the source is preserved — the copy at the destination is the authoritative copy.
+func (app *App) transferLocal(ctx context.Context, src, dst string) (string, error) {
+	if app.Config.CopyMode {
+		if err := copyFile(src, dst); err != nil {
+			return "file operation failed", err
+		}
+		return "", nil
+	}
+
+	if err := osRename(src, dst); err != nil {
+		var linkErr *os.LinkError
+		if !errors.As(err, &linkErr) || !errors.Is(linkErr.Err, syscall.EXDEV) {
+			return "file operation failed", err
+		}
+		// Source and destination are on different filesystems (e.g. local → SMB/NFS mount).
+		// os.Rename only works within a single device; fall back to copy + delete.
+		if copyErr := copyFile(src, dst); copyErr != nil {
+			return "file operation failed", copyErr
+		}
+		// If a signal arrived after the copy completed, skip removing the source.
+		// The destination holds a complete, timestamp-preserved copy; the original
+		// is left in place as a safety net for the user to inspect.
+		if ctx.Err() != nil {
+			logrus.Warnf("interrupted after copy; source preserved: %s (copy at: %s)", src, dst)
 			return "", nil
 		}
-		if err := os.Rename(path, targetPath); err != nil {
-			var linkErr *os.LinkError
-			if errors.As(err, &linkErr) && errors.Is(linkErr.Err, syscall.EXDEV) {
-				// Source and destination are on different filesystems (e.g. local → SMB/NFS mount).
-				// os.Rename only works within a single device; fall back to copy + delete.
-				if copyErr := copyFile(path, targetPath); copyErr != nil {
-					return "file operation failed", copyErr
-				}
-				if removeErr := os.Remove(path); removeErr != nil {
-					return "file operation failed", removeErr
-				}
-			} else {
-				return "file operation failed", err
-			}
+		if removeErr := os.Remove(src); removeErr != nil {
+			return "file operation failed", removeErr
 		}
 	}
 
@@ -561,6 +716,9 @@ func isMediaFile(path string) bool {
 	_, ok := mediaExtensions[strings.ToLower(filepath.Ext(path))]
 	return ok
 }
+
+// osRename is a variable so tests can inject a fake EXDEV error without needing two real filesystems.
+var osRename = os.Rename
 
 // copyBufPool recycles 1 MiB buffers across copyFile calls to reduce allocations and GC pressure.
 // 1 MiB is chosen to amortise syscall overhead for large video files while staying CPU-cache friendly.
