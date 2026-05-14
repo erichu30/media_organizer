@@ -193,3 +193,70 @@ func TestValidatePaths_RemoteSuccess(t *testing.T) {
 	err := validatePaths(cfg)
 	assert.NoError(t, err)
 }
+
+// ---- isSFTPPath / toRcloneSFTPPath / isRclonePath ----
+
+func TestIsSFTPPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"root@192.168.0.83:/mnt/photos", true},
+		{"user@host:path", true},
+		{"remotename:/path", false},  // rclone remote, no @
+		{"/local/path", false},       // plain local
+		{"C:\\Windows\\path", false}, // Windows-style local
+		{"@missinguser:path", false}, // @ at index 0
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, isSFTPPath(tc.in))
+		})
+	}
+}
+
+func TestToRcloneSFTPPath(t *testing.T) {
+	cases := []struct {
+		in      string
+		keyFile string
+		want    string
+	}{
+		{
+			"root@192.168.0.83:/mnt/naspool/photo", "",
+			":sftp,host=192.168.0.83,user=root:/mnt/naspool/photo",
+		},
+		{
+			"alice@nas:backup", "",
+			":sftp,host=nas,user=alice:backup",
+		},
+		{
+			"root@192.168.0.83:/mnt/photos", "/home/user/.ssh/id_ed25519",
+			":sftp,host=192.168.0.83,user=root,key_file=/home/user/.ssh/id_ed25519:/mnt/photos",
+		},
+		{"remotename:/path", "", "remotename:/path"},
+		{"/local/path", "", "/local/path"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, toRcloneSFTPPath(tc.in, tc.keyFile))
+		})
+	}
+}
+
+func TestIsRclonePath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"myremote:/photos", true},
+		{"root@192.168.0.83:/mnt/p", true},
+		{"user@host:path", true},
+		{"/local/path", false},
+		{"relative/path", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, isRclonePath(tc.in))
+		})
+	}
+}
