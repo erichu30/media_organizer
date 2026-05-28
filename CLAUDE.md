@@ -43,20 +43,14 @@ docker run --rm -v /path/to/input:/input -v /path/to/output:/output \
 
 ## Architecture
 
-See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full package layout, data-flow diagram, and design-decision rationale.
-
-**Quick summary:**
-- `src/internal` — ExifTool pool (goroutine-safe wrapper around `go-exiftool`)
-- `src/cmd` — main application: config, worker pool, file transfer (local + rclone), signal handling, failure log
-
-Key files: `app.go` (App/Stats), `config.go` (flag parsing + SSH path normalization), `process.go` (worker/processFile), `fileops.go` (transfer + circuit breaker), `fileutil_darwin.go` / `fileutil_other.go` (timestamp preservation).
+See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Reference Docs
 
-| File | Purpose |
+| File | Read When |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Package layout, data flow, design decisions |
-| [TASKS.md](TASKS.md) | Planned work items with analysis and trade-offs |
-| [ERRORS.md](ERRORS.md) | Pitfalls — read before touching related code |
-| [CONVENTIONS.md](CONVENTIONS.md) | Naming, patterns, and code style |
-| [skill.md](skill.md) | Claude Code skills useful for this project |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Touching package structure, adding a new transfer path, or understanding a design decision |
+| [ERRORS.md](ERRORS.md) | Editing `fileops.go`, `exiftool_pool.go`, `process.go`, `fileutil_*.go`, or any transfer/signal path |
+| [CONVENTIONS.md](CONVENTIONS.md) | Adding a new function, flag, test, or unsure about naming/pattern |
+| [TASKS.md](TASKS.md) | Implementing a new feature — check for existing analysis before designing |
+| [SKILLS.md](SKILLS.md) | Choosing which skill to invoke for a task |
