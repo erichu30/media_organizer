@@ -105,6 +105,7 @@ func (app *App) Run(ctx context.Context) (interrupted bool) {
 		progressbar.OptionShowIts(),
 		progressbar.OptionClearOnFinish(),
 	)
+	bar.RenderBlank()
 
 	jobs := make(chan string, app.Config.Buffer)
 	var wg sync.WaitGroup
