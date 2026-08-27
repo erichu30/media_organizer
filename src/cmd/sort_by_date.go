@@ -54,6 +54,11 @@ func run() int {
 
 	// Past this point logrus writes to the log file, so every user-facing failure
 	// has to be printed to stderr as well or the terminal shows nothing at all.
+	if err := validateDependencies(config); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		logrus.Error(err)
+		return 1
+	}
 	if err := validatePaths(config); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		logrus.Error(err)

@@ -223,15 +223,28 @@ func validateConfig(config *Config) error {
 	return nil
 }
 
-// validatePaths ensures input and output paths are usable before the run starts.
-func validatePaths(config *Config) error {
+// validateDependencies checks for the external binaries the run needs.
+//
+// Kept separate from validatePaths so a missing binary cannot mask a bad path: the
+// two answer different questions, and a user with neither should be told about both
+// in turn rather than only the first one checked.
+func validateDependencies(config *Config) error {
 	// exiftool is needed for every run, not just remote ones. Without this check the
 	// failure surfaces later as a pool-initialisation error.
 	if _, err := exec.LookPath("exiftool"); err != nil {
 		return errors.New("exiftool command not found — install it first " +
 			"(macOS: brew install exiftool, Debian/Ubuntu: apt install libimage-exiftool-perl)")
 	}
+	if config.IsRemote {
+		if _, err := exec.LookPath("rclone"); err != nil {
+			return errors.New("rclone command not found, required for remote output sync")
+		}
+	}
+	return nil
+}
 
+// validatePaths ensures input and output paths are usable before the run starts.
+func validatePaths(config *Config) error {
 	info, err := os.Stat(config.InputPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -243,11 +256,8 @@ func validatePaths(config *Config) error {
 		return fmt.Errorf("input path must be a directory: %s", config.InputPath)
 	}
 
-	if config.IsRemote {
-		if _, err := exec.LookPath("rclone"); err != nil {
-			return fmt.Errorf("rclone command not found, required for remote output sync")
-		}
-	} else {
+	// A remote destination needs no local directory: rclone creates what it needs.
+	if !config.IsRemote {
 		if err := os.MkdirAll(config.OutputPath, 0755); err != nil {
 			return fmt.Errorf("failed to create or access output directory: %w", err)
 		}

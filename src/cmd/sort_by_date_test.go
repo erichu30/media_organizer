@@ -154,27 +154,8 @@ func TestValidatePaths_LocalOutputCreationFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to create or access output directory")
 }
 
-func TestValidatePaths_RemoteMissingTools(t *testing.T) {
-	tmp := t.TempDir()
-	inDir := filepath.Join(tmp, "input")
-	require.NoError(t, os.Mkdir(inDir, 0755))
-
-	cfg := &Config{
-		InputPath:  inDir,
-		OutputPath: "myremote:/path",
-		IsRemote:   true,
-	}
-
-	// Clear PATH temporarily to simulate missing rclone
-	origPath := os.Getenv("PATH")
-	defer os.Setenv("PATH", origPath)
-	os.Setenv("PATH", "")
-
-	err := validatePaths(cfg)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "command not found")
-}
-
+// TestValidatePaths_RemoteNeedsNoLocalDir confirms a remote destination is not
+// created on the local disk — rclone makes what it needs at the far end.
 func TestValidatePaths_RemoteSuccess(t *testing.T) {
 	tmp := t.TempDir()
 	inDir := filepath.Join(tmp, "input")
@@ -186,12 +167,61 @@ func TestValidatePaths_RemoteSuccess(t *testing.T) {
 		IsRemote:   true,
 	}
 
-	if _, err := exec.LookPath("rclone"); err != nil {
-		t.Skip("rclone not found in PATH, skipping remote success test")
-	}
+	assert.NoError(t, validatePaths(cfg))
+	assert.NoDirExists(t, filepath.Join(tmp, "myremote:"))
+}
 
-	err := validatePaths(cfg)
-	assert.NoError(t, err)
+// ---- validateDependencies ----
+
+// TestValidateDependencies_MissingTools checks both binaries are reported by name.
+// They live outside validatePaths on purpose: when this check ran first inside it, a
+// machine without exiftool got "exiftool not found" for every bad path too, and the
+// real problem stayed hidden.
+func TestValidateDependencies_MissingTools(t *testing.T) {
+	cases := []struct {
+		name     string
+		isRemote bool
+		wantMsg  string
+	}{
+		{"local run still needs exiftool", false, "exiftool command not found"},
+		{"remote run needs exiftool first", true, "exiftool command not found"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PATH", "")
+
+			err := validateDependencies(&Config{OutputPath: "myremote:/path", IsRemote: tc.isRemote})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMsg)
+		})
+	}
+}
+
+// TestValidateDependencies_RemoteNeedsRclone isolates the rclone branch by putting a
+// stub exiftool on PATH, so the test does not depend on the host having either tool.
+func TestValidateDependencies_RemoteNeedsRclone(t *testing.T) {
+	stubDir := t.TempDir()
+	stub := filepath.Join(stubDir, "exiftool")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0755))
+	t.Setenv("PATH", stubDir)
+
+	err := validateDependencies(&Config{OutputPath: "myremote:/path", IsRemote: true})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rclone command not found")
+
+	// The same stub PATH is fine for a local run, which needs no rclone.
+	assert.NoError(t, validateDependencies(&Config{OutputPath: "/tmp/out"}))
+}
+
+func TestValidateDependencies_AllPresent(t *testing.T) {
+	for _, bin := range []string{"exiftool", "rclone"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not found in PATH", bin)
+		}
+	}
+	assert.NoError(t, validateDependencies(&Config{OutputPath: "myremote:/path", IsRemote: true}))
 }
 
 // ---- isSFTPPath / toRcloneSFTPPath / isRclonePath ----
