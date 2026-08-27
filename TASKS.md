@@ -1,5 +1,43 @@
 # TODO
 
+Design analysis for work that is planned but not built. Each entry states the problem,
+lays out the options considered, and marks a recommendation.
+
+**Before implementing anything here, read the entry first.** The analysis is the
+expensive part; re-deriving it wastes more time than reading it. If you disagree with a
+recommendation, say so and why — do not silently pick a different option.
+
+**When an entry ships,** move it to *Shipped* below with the commit that did it, and
+delete the analysis only if nothing in it is still true.
+
+| Task | Status |
+|---|---|
+| [SSH Session Reuse / Batch rclone](#ssh-session-reuse--batch-rclone-optimization) | Not implemented — **design needs revision**, see note |
+| [Source Disk Disconnect Resilience](#source-disk-disconnect-resilience) | Not implemented |
+| [Content Verification for Duplicate Detection](#content-verification-for-duplicate-detection) | Not implemented |
+
+---
+
+## Shipped
+
+Kept short. The reasoning lives in [ERRORS.md](ERRORS.md) and [ARCHITECTURE.md](ARCHITECTURE.md);
+this list exists so nobody re-solves a solved problem.
+
+| What | Where | Commit |
+|---|---|---|
+| Destination conflict policy (`-on-conflict`) — duplicate basenames no longer overwrite | `conflict.go` | `79cb430` |
+| Flag validation — `-workers 0` hang, negative `-buffer` panic | `validateConfig` in `config.go` | `79cb430` |
+| Startup errors reach stderr, not just the log file | `run()` in `sort_by_date.go` | `79cb430` |
+| Exit codes 0/1/2 | `run()` in `sort_by_date.go` | `79cb430` |
+| Cancellation drain — Ctrl-C stops in seconds, queued files reported as not attempted | `worker` in `app.go` | `79cb430` |
+| Circuit breaker announces once | `recordRemoteFailure` in `process.go` | `79cb430` |
+| Local paths containing `:` no longer routed through rclone | `isRclonePath` in `config.go` | `79cb430` |
+| NAS / photo-library directories excluded from the walk | `isExcludedDir` in `fileops.go` | `79cb430` |
+| Log rotation and `-log` | `sort_by_date.go` | `79cb430` |
+| Dependency checks split from path checks | `validateDependencies` in `config.go` | `e4af12e` |
+
+---
+
 ## SSH Session Reuse / Batch rclone Optimization
 
 **Status:** Not implemented
@@ -19,7 +57,7 @@ The actual data transfer is fast; the connection setup cost dominates for small 
 Configure OpenSSH ControlMaster multiplexing via `~/.ssh/config`:
 
 ```
-Host 192.168.0.83
+Host nas.example.lan
     ControlMaster auto
     ControlPath ~/.ssh/control-%C
     ControlPersist 60s
@@ -27,7 +65,33 @@ Host 192.168.0.83
 
 **Why it won't help:** rclone's SFTP backend uses its own Go SSH client (`golang.org/x/crypto/ssh`), not the system `ssh` binary, so it never reads `ControlPath` or reuses an existing socket. No code change can make this work without replacing rclone's transport.
 
-### Option B — Batch by destination folder via `--files-from` (recommended)
+### Option B — Batch by destination folder via `--files-from` (recommended, needs revision)
+
+> **This design predates `-on-conflict` and no longer composes with it.** Read this box
+> before implementing.
+>
+> **The conflict.** `--files-from` transfers a list of sources into one destination
+> folder **under their original basenames**. rclone has no per-file rename within a
+> batch. So `-on-conflict rename`, which is the default, cannot be expressed as a single
+> batched call: a file that needs to become `IMG_0001_1.jpg` has to leave the batch.
+>
+> **Suggested shape.** Resolve every destination with `resolveTarget` first, then split
+> the group: files whose final path equals their original basename go in the batch; files
+> that were renamed, and files whose destination directory differs, fall back to
+> individual `moveto`/`copyto` calls. In a typical import the renamed set is a small
+> fraction, so most of the handshake saving survives.
+>
+> **Two things already built that help.**
+> - `remoteDirIndex` (`conflict.go`) already lists each `YYYY/MM` directory exactly once
+>   per run via `rclone lsf` and caches it. Batching needs that same listing to decide
+>   conflicts, so reuse the cache rather than adding a second probe. It also makes
+>   `--no-traverse` the right flag: the listing is already in hand.
+> - `-on-conflict skip` maps directly onto rclone's native `--ignore-existing`, so that
+>   policy costs nothing extra in batch mode.
+>
+> **Do not** implement batching by dropping the conflict check for remote destinations.
+> That reintroduces the silent-overwrite data loss that `conflict.go` exists to prevent.
+
 
 Instead of one rclone process per file, group source files by their `YYYY/MM` destination and issue one rclone invocation per unique destination folder.
 
@@ -198,3 +262,88 @@ for _, path := range paths {
 | Misleading reason | **1B** (pre-check `Lstat` in `processFile`) — simpler, survives exiftool error wrapping |
 | Source circuit breaker | **2A** (separate `-source-fail-threshold` flag) — consistent with existing pattern |
 | Walk continues on I/O | **3B** (feeder-loop `Lstat` validation) — non-aborting, pairs naturally with 2A |
+
+---
+
+## Content Verification for Duplicate Detection
+
+**Status:** Not implemented
+
+### Problem
+
+`resolveTarget` (`conflict.go`) treats a destination file **of the same size** as the
+same file, reports `actionSkipIdentical`, and leaves the source alone. That is what
+keeps re-runs idempotent — without it a second `-copy` pass would produce `photo_1.jpg`,
+then `photo_2.jpg`.
+
+Size is a weak identity signal. Two genuinely different photos that happen to share a
+byte count are treated as the same file, and the incoming one is never transferred.
+
+**The failure is safe but not silent-free:**
+
+| | Behaviour |
+|---|---|
+| Data loss | None. In move mode the source is *kept*, not deleted |
+| Visible? | Counted under `Already there` in the summary |
+| Cost to the user | A file they expected to be filed is still sitting in the input |
+
+The likelihood is low for camera originals (JPEG sizes vary widely) and higher for
+generated content — thumbnails, exported-at-fixed-quality batches, screenshots at a
+fixed resolution.
+
+### Why size only, today
+
+The check has to work for both destinations:
+
+- **Local:** `os.Lstat` gives size for free — it is already being called to test existence.
+- **Remote:** `rclone lsf --format sp` returns size in the directory listing that
+  `remoteDirIndex` already fetches. Zero extra round trips.
+
+Anything stronger costs a full read of both files.
+
+### Option 1 — Opt-in hash verification (`-verify hash`)
+
+Add a flag that, **only when sizes match**, hashes both sides before deciding.
+
+- Local: read both files, compare (e.g. BLAKE3 or SHA-256).
+- Remote: `rclone hashsum` — but note not every backend supports every hash, and some
+  (crypt, some object stores) may force a download.
+
+**Cost:** one extra full read per size-collision, not per file. In a re-run over an
+already-organized library that is *every* file, which is the expensive case exactly when
+the feature matters least.
+
+**Mitigation:** hash only the first and last 64 KiB plus the size. Cheap, and for real
+media files a collision needs deliberate construction.
+
+### Option 2 — Compare modification time alongside size (recommended first step)
+
+`copyFile` already calls `preserveTimestamps`, and rclone preserves mtime on most
+backends, so a file this tool transferred should carry the source's mtime. Requiring
+`size == size && mtime == mtime` is nearly free:
+
+- Local: `os.Lstat` already returns both.
+- Remote: `rclone lsf --format spt` adds mtime to the listing already being fetched.
+
+**Cost:** one extra character in the `lsf` format string.
+
+**Caveat:** backends with coarse or absent mtime support (some object stores, SMB in
+certain configurations) would start reporting false conflicts and renaming files that
+are in fact already there. Needs a fallback to size-only when the listing has no usable
+timestamp — an empty or zero mtime must not be compared.
+
+### Option 3 — Leave it, document it
+
+The current behaviour is already the safe direction: it declines to transfer rather than
+risking a duplicate, and never deletes. Documented in
+[ARCHITECTURE.md](ARCHITECTURE.md#destination-conflict-resolution) and [ERRORS.md](ERRORS.md).
+
+### Recommendation
+
+**Option 2 first** — it removes most of the false-identical cases for the price of one
+extra field in a listing already being fetched, and it degrades to today's behaviour
+when mtime is unavailable. Revisit Option 1 only if a real collision is observed in
+practice.
+
+Before building either, get a measurement: run over a real library and count how many
+files land in `Already there`, and how many of those are genuinely the same file.

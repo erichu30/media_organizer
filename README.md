@@ -68,6 +68,8 @@ This creates `build/sort_by_date`.
 
 ## Usage
 
+Verbatim `-h` output — regenerate with `./build/sort_by_date -h` after adding a flag.
+
 ```
 Usage: ./build/sort_by_date [OPTIONS]
 
@@ -89,6 +91,8 @@ Options:
     	Show what would be done, without moving/copying files
   -estimate
     	Sample two files to measure destination speed and show a time estimate (remote only; skipped in dry-run)
+  -failure-log string
+    	Write failed-file records as NDJSON to this path ("auto" = timestamp-based filename)
   -i string
     	Input directory
   -log string
@@ -97,20 +101,28 @@ Options:
     	Output directory
   -on-conflict string
     	What to do when the destination filename is already taken: rename | skip | overwrite | fail (default "rename")
-  -failure-log string
-    	Write failed-file records as NDJSON to this path ("auto" = timestamp-based filename)
   -only-datetimeoriginal
     	Only process files with DateTimeOriginal tag
   -remote-fail-threshold int
-    	abort after this many consecutive remote failures; 0 to disable (default 5)
+    	abort after this many consecutive remote failures, 0 to disable (default 5)
   -retries int
-    	rclone retry count for transient remote errors — SSH disconnect, timeouts (default 3)
+    	rclone retry count for transient remote errors (SSH disconnect, timeouts) (default 3)
   -ssh-key string
     	Path to SSH private key for user@host:/path destinations (e.g. ~/.ssh/id_ed25519)
   -use-file-modify-date
     	Use file modify date as a fallback
   -workers int
     	Number of concurrent workers (default 8)
+
+Duplicate filenames:
+	Two photos named IMG_0001.jpg taken in the same month both want the same
+	destination. -on-conflict decides what happens (default: rename):
+	  rename     write the second one as IMG_0001_1.jpg
+	  skip       leave the destination alone, leave the source where it is
+	  overwrite  replace the file at the destination — data is lost
+	  fail       count the file as a failure and move on
+	A destination file of the same size is always treated as already transferred,
+	so re-running over the same input does not pile up duplicates.
 
 Examples:
 	./build/sort_by_date -i /path/to/input -o /path/to/output
@@ -119,8 +131,6 @@ Examples:
 	./build/sort_by_date -i /path/to/input -o root@192.168.1.10:/mnt/nas/photos -ssh-key ~/.ssh/id_ed25519 -estimate
 	./build/sort_by_date -i /path/to/input -o /path/to/output -dry-run
 	./build/sort_by_date -i /path/to/input -o /path/to/output -failure-log auto
-	./build/sort_by_date -i /path/to/input -o /path/to/output -failure-log /tmp/failures.ndjson
-	./build/sort_by_date -i /path/to/input -o /path/to/output -on-conflict skip
 ```
 
 ## Duplicate Filenames
@@ -142,6 +152,99 @@ transferred and skipped, so re-running over the same input does not pile up
 
 For remote destinations each `YYYY/MM` directory is listed once per run with
 `rclone lsf`, not once per file.
+
+## Common Tasks
+
+Task-first index. Every command assumes the binary is at `./build/sort_by_date`.
+
+### "I want to see what would happen, without touching anything"
+
+```bash
+./build/sort_by_date -i ~/Pictures/import -o ~/Photos -dry-run
+```
+
+Creates no files and no directories. Read the `Mode` line to confirm move-vs-copy and
+the conflict policy before doing it for real.
+
+### "I'm organizing a folder for the first time and don't want to lose the originals"
+
+```bash
+./build/sort_by_date -i ~/Pictures/import -o ~/Photos -copy
+```
+
+`-copy` keeps the source. Without it the default is **move**, which deletes the original
+once the destination is written.
+
+### "Lots of files failed with 'no EXIF date'"
+
+Screenshots, downloaded images, and anything that has been through a messaging app
+usually carry no EXIF. Fall back to the filesystem timestamp:
+
+```bash
+./build/sort_by_date -i ~/Pictures/import -o ~/Photos -use-file-modify-date
+```
+
+Be aware that a file's modification time is when *that copy* was written, which is not
+always when the photo was taken.
+
+### "I only trust the camera's own timestamp"
+
+```bash
+./build/sort_by_date -i ~/Pictures/import -o ~/Photos -only-datetimeoriginal
+```
+
+Anything without a `DateTimeOriginal` tag is counted as a failure and left alone, rather
+than filed under a date derived from `CreateDate` or `DateCreated`.
+
+### "I'm re-running over a folder I already organized"
+
+Just run it again. A destination file of the same size is treated as already transferred,
+so the second pass reports `Already there` instead of creating `_1` duplicates.
+
+### "I have duplicates and I want to deal with them by hand"
+
+```bash
+./build/sort_by_date -i ~/Pictures/import -o ~/Photos -on-conflict skip
+```
+
+Conflicting files stay in the input folder. Whatever is left in the input after the run
+is exactly the set that needs a decision.
+
+### "Send it to my NAS over SSH"
+
+```bash
+./build/sort_by_date -i ~/Pictures/import \
+  -o admin@192.168.1.10:/volume1/photo \
+  -ssh-key ~/.ssh/id_ed25519 -copy -estimate
+```
+
+`-estimate` samples two files first and prints a projected total time — worth it before
+committing to a long transfer. Drop it once you know how fast the link is.
+
+### "The transfer keeps dying halfway"
+
+```bash
+./build/sort_by_date -i ~/Pictures/import -o mynas:/photo \
+  -retries 5 -remote-fail-threshold 10 -failure-log auto
+```
+
+`-retries` is passed to rclone for transient errors. `-remote-fail-threshold` aborts the
+run after that many consecutive failures instead of grinding through thousands of files
+against a dead link. The failure log gives you the exact list to retry.
+
+### "It's running from cron and I need to know if it worked"
+
+```bash
+./build/sort_by_date -i /mnt/incoming -o mynas:/photo -log /var/log/sort_by_date.log
+echo $?   # 0 = everything transferred · 1 = failures or interrupted · 2 = bad flags
+```
+
+### "Something went wrong and I need the details"
+
+Per-file errors are in the log (`sortbydate.log` by default, or `-log <path>`). For a
+machine-readable list of exactly what failed and why, add `-failure-log auto`.
+
+---
 
 ## Pre-transfer Info
 
@@ -184,22 +287,41 @@ The two-file probe separates fixed SSH/rclone startup cost from actual data-tran
 After all files are processed, a brief summary is printed to stdout:
 
 ```
+--- Pre-transfer ---
+  Files      : 3
+  Total size : 1.5 KB
+  Skipped    : 1 non-media files
+  Mode       : copy to local destination (on conflict: rename)
+
 --- Summary ---
-  Media files : 150
-  Success     : 143
-  Failed      : 5
-    DateTimeOriginal not found:    3
-    file operation failed:         2
-  Renamed     : 2 (name already taken at destination)
-  Already there : 0 (same-sized file at destination; source left in place)
+  Media files : 3
+  Success     : 2
+  Failed      : 1
+    no EXIF date:                  1
+  Renamed     : 1 (name already taken at destination)
+  Skipped     : 1 (non-media files)
 
 --- Hints ---
-  • 3 file(s) had no EXIF date. Screenshots and downloaded images usually have none —
+  • 1 file(s) had no EXIF date. Screenshots and downloaded images usually have none —
     re-run with -use-file-modify-date to fall back to the file's modification time.
+  • Renamed files kept a "_1"-style suffix. Use -on-conflict skip to leave
+    duplicates in the input instead, or -on-conflict fail to stop on them.
+  • Per-file errors are in sortbydate.log. Add -failure-log auto to get them as NDJSON.
 ```
 
-An interrupted or aborted run adds a `Not attempted` line so the counts always add up
-to the number of media files found.
+The counts always add up to `Media files`. Lines only appear when they are non-zero:
+
+| Line | Meaning |
+|---|---|
+| `Success` | Transferred |
+| `Failed` | Broken down by reason underneath |
+| `Renamed` | Transferred, but under a `_1`-style name |
+| `Already there` | A same-sized file was already at the destination; the source was left in place |
+| `Conflicts skipped` | `-on-conflict=skip` and the destination differed |
+| `Not attempted` | The run ended (interrupt or circuit breaker) before these files were reached |
+| `Skipped` | Not a media file — never counted in `Media files` |
+
+`--- Hints ---` only appears when there is something actionable to say.
 
 When `-failure-log` is set, the path is also shown in the summary:
 
@@ -291,20 +413,22 @@ The tool handles `SIGINT` (Ctrl-C), `SIGTERM`, and `SIGHUP` gracefully:
 
 1. **Feeder stops** — no new files are dispatched to workers
 2. **Workers finish current file** — in-progress operations complete their current step before exiting
-3. **Recovery per operation type:**
+3. **Queued-but-unstarted files are dropped, not attempted** — up to `-buffer` files are already sitting in the channel when the signal lands. They are counted as `Not attempted` and left exactly where they are, so Ctrl-C returns in seconds instead of grinding through a queue of transfers that would all fail anyway
+4. **Recovery per operation type:**
    - `os.Rename` — atomic; no recovery needed
    - Cross-device move (copy+delete fallback): if a signal arrives after the copy but before the source delete, the delete is skipped — both source and destination exist; source is the safety net
    - `rclone moveto/copyto` — subprocess is killed immediately; a best-effort `rclone deletefile` removes any partial remote file (source is always intact — rclone never deletes local source until transfer fully succeeds)
-4. **Buffers flushed** — the failure log is flushed and closed before exit
-5. **Partial summary printed** — the summary includes a `WARNING: interrupted` notice
+5. **Buffers flushed** — the failure log is flushed and closed before exit
+6. **Partial summary printed** — the summary includes a `WARNING: interrupted` notice and accounts for every file found
 
 ```
 --- Summary ---
   WARNING: interrupted — results below are partial
-  Processed : 142
-  Success   : 87
-  Failed    : 2
-    no EXIF date:                    2
+  Media files : 300
+  Success     : 24
+  Failed      : 8
+    file operation failed:         8
+  Not attempted : 268 (run ended before these files were reached)
 ```
 
 Exit code is `0` only when every file was handled successfully. It is `1` when the run
