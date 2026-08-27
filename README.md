@@ -13,11 +13,13 @@ A command-line tool to organize media files (photos and videos) into a directory
 - **Dry-Run Mode**: Preview the results without making any changes to your files.
 - **Remote Sync**: Transfer files to a remote server using `rclone` (supports S3, SFTP, Dropbox, and 40+ backends). Accepts both rclone remote syntax (`remotename:path`) and SSH shorthand (`user@host:/path`). Configurable retry count and circuit breaker for resilience against SSH disconnects.
 - **Timestamp Preservation**: When copying, the destination file retains the original `FileModifyDate`, `FileAccessDate`, and (on macOS) `FileCreatedDate` — EXIF file metadata is unchanged.
-- **Run Summary**: Prints a brief summary to stdout after processing — total processed, success count, and failed count broken down by reason.
+- **Duplicate-safe**: Two files that share a basename and land in the same `YYYY/MM` folder never overwrite each other. `-on-conflict` picks the policy (`rename` by default, or `skip` / `overwrite` / `fail`), and a same-sized file already at the destination is treated as already transferred so re-runs stay idempotent.
+- **Run Summary**: Prints a brief summary to stdout after processing — media file count, success count, failed count broken down by reason, plus renamed / already-present / not-attempted counts so every file is accounted for.
+- **Actionable Hints**: When a run finishes with fixable problems (files with no EXIF date, name conflicts), it prints the flag that addresses them.
 - **Structured Failure Log**: Optionally writes one NDJSON record per failed file (`-failure-log auto` or `-failure-log <path>`), including path, size, reason, error, and duration.
 - **Pre-transfer Info**: Before starting, prints file count and total size. With `-estimate` (remote mode), transfers two sample files (10th and 90th percentile by size) to measure per-file SSH overhead and bandwidth, then shows a projected total transfer time.
 - **Signal Handling**: Responds to `SIGINT` (Ctrl-C), `SIGTERM`, and `SIGHUP` with a graceful shutdown — in-progress file operations finish before exit, all buffers are flushed, and the summary is printed with a partial-results warning. A second signal force-quits immediately.
-- **Logging**: Keeps a log of all operations in `sortbydate.log`.
+- **Logging**: Keeps a log of all operations in `sortbydate.log` (change with `-log <path>`). The log is rotated to `<path>.1` once it passes 50 MB.
 
 ## Dependencies
 
@@ -89,8 +91,12 @@ Options:
     	Sample two files to measure destination speed and show a time estimate (remote only; skipped in dry-run)
   -i string
     	Input directory
+  -log string
+    	Path to the operational log file (default "sortbydate.log")
   -o string
     	Output directory
+  -on-conflict string
+    	What to do when the destination filename is already taken: rename | skip | overwrite | fail (default "rename")
   -failure-log string
     	Write failed-file records as NDJSON to this path ("auto" = timestamp-based filename)
   -only-datetimeoriginal
@@ -114,7 +120,28 @@ Examples:
 	./build/sort_by_date -i /path/to/input -o /path/to/output -dry-run
 	./build/sort_by_date -i /path/to/input -o /path/to/output -failure-log auto
 	./build/sort_by_date -i /path/to/input -o /path/to/output -failure-log /tmp/failures.ndjson
+	./build/sort_by_date -i /path/to/input -o /path/to/output -on-conflict skip
 ```
+
+## Duplicate Filenames
+
+Cameras restart their file counters, so `IMG_0001.jpg` recurs across imports. Two such
+files shot in the same month both want `2023/05/IMG_0001.jpg`. `-on-conflict` decides
+what happens:
+
+| Value | Behaviour |
+|---|---|
+| `rename` (default) | The second file is written as `IMG_0001_1.jpg`, then `_2`, and so on. Nothing is lost. |
+| `skip` | The destination is left alone and the source stays where it is. Counted under "Conflicts skipped". |
+| `overwrite` | The destination file is replaced. **Data is lost** — only use this when you know the destination is disposable. |
+| `fail` | The file is counted as a failure and the run continues. |
+
+Whatever the policy, a destination file **of the same size** is treated as already
+transferred and skipped, so re-running over the same input does not pile up
+`_1`, `_2`, `_3` copies of files that are already there.
+
+For remote destinations each `YYYY/MM` directory is listed once per run with
+`rclone lsf`, not once per file.
 
 ## Pre-transfer Info
 
@@ -158,14 +185,21 @@ After all files are processed, a brief summary is printed to stdout:
 
 ```
 --- Summary ---
-  Processed : 150
-  Success   : 143
-  Failed    : 7
-    DateTimeOriginal not found:      3
-    directory creation failed:       1
-    file operation failed:           2
-    no EXIF date:                    1
+  Media files : 150
+  Success     : 143
+  Failed      : 5
+    DateTimeOriginal not found:    3
+    file operation failed:         2
+  Renamed     : 2 (name already taken at destination)
+  Already there : 0 (same-sized file at destination; source left in place)
+
+--- Hints ---
+  • 3 file(s) had no EXIF date. Screenshots and downloaded images usually have none —
+    re-run with -use-file-modify-date to fall back to the file's modification time.
 ```
+
+An interrupted or aborted run adds a `Not attempted` line so the counts always add up
+to the number of media files found.
 
 When `-failure-log` is set, the path is also shown in the summary:
 
@@ -273,10 +307,19 @@ The tool handles `SIGINT` (Ctrl-C), `SIGTERM`, and `SIGHUP` gracefully:
     no EXIF date:                    2
 ```
 
-Exit code is `1` when interrupted, `0` on a complete run.
+Exit code is `0` only when every file was handled successfully. It is `1` when the run
+was interrupted or any file failed, and `2` when the command line itself was rejected
+(missing `-i`/`-o`, an out-of-range `-workers`, an unknown `-on-conflict` value). This
+makes the tool safe to drive from cron or a shell script.
 
 A **second signal** (e.g. two Ctrl-C presses) reverts to default OS behaviour and terminates the process immediately.
 
 ## Logging
 
-All operations are logged to `sortbydate.log` in the current working directory. Check this file for details when errors or unexpected behaviour occur.
+All operations are logged to `sortbydate.log` in the current working directory. Pass
+`-log <path>` to write somewhere else — useful when the tool is run from a different
+directory each time, or from a container whose working directory is a mounted volume.
+
+The log is append-only and writes roughly one line per file, so it grows without
+bound over a long-lived install. Once it passes 50 MB it is rotated to `<path>.1`
+(replacing any previous rotation) at the start of the next run.

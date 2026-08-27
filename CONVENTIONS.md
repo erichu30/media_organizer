@@ -90,7 +90,9 @@ func main() { os.Exit(run()) }
 
 - Default level: `logrus.InfoLevel`
 - `-debug` flag: `logrus.DebugLevel` + full EXIF JSON per file
-- All log output goes to `sortbydate.log` (append) in the working directory
+- All log output goes to the `-log` path (append), `sortbydate.log` in the working directory by default
+- Anything the user must see goes to **stderr as well as** the logger. `setupLogging` redirects logrus to a file, so a `logrus.Fatal` after that point leaves the terminal blank
+- `run()` returns an exit code — `0` all good, `1` failures or interruption, `2` bad command line. Never call `os.Exit` outside `main()`
 - Use `logrus.WithField` / `logrus.WithFields` — never `fmt.Println` for operational output
 - Stats summary goes to `fmt.Fprintf(os.Stdout, ...)` via `Stats.print` — not to the logger
 

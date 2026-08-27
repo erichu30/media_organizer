@@ -14,6 +14,7 @@ media_organizer/
 │       ├── config.go             # Config, flag parsing, SSH path conversion
 │       ├── process.go            # processFile, dirCache, worker loop
 │       ├── fileops.go            # transferLocal, transferRemote, circuit breaker
+│       ├── conflict.go           # -on-conflict policy, destination probing, name claiming
 │       ├── fileutil_darwin.go    # preserveTimestamps (darwin: birth time via setattrlist)
 │       ├── fileutil_other.go     # preserveTimestamps (non-darwin: mtime via os.Chtimes)
 │       ├── failure_log.go        # FailureLogger (NDJSON, buffered, mutex-guarded)

@@ -93,3 +93,44 @@ When rclone is killed mid-transfer (signal or crash), it may leave a partial fil
 ## 12. `--files-from` batch mode (not yet implemented) — per-file failure tracking is lossy
 
 See `TASKS.md`. `rclone move --files-from` fails the entire batch on a single error. Parsing per-file status from `--log-level DEBUG` stdout is fragile and version-dependent. Do not assume individual file success/failure from a batch invocation without verifying rclone's current log format.
+
+---
+
+## 13. Destination collisions are silent data loss on every transfer path
+
+`os.Rename`, `os.Create` (inside `copyFile`), and `rclone moveto` all replace the
+destination without a word. Two photos named `IMG_0001.jpg` from the same month both
+resolve to `2023/05/IMG_0001.jpg`, and the second one used to erase the first while
+the summary still counted two successes.
+
+Every destination now goes through `resolveTarget` in `conflict.go` before any
+transfer. Do not add a transfer path that bypasses it.
+
+---
+
+## 14. `resolveTarget` must claim a name before checking the filesystem
+
+Two workers can resolve the same basename at the same instant. Neither file exists at
+the destination yet, so a naive "does it exist?" check hands both workers the same
+path and one of them loses. `claimIfFree` reserves the name in `app.claimed` **first**
+and releases it only if the destination turns out to be occupied.
+
+---
+
+## 15. Cancelled work must not be counted as failure
+
+The worker loop reads `ctx.Err()` at the top of every iteration. Without it, the files
+already sitting in the jobs channel when Ctrl-C arrives are still attempted: each one
+fails instantly against the cancelled context, and each failure then pays for a remote
+cleanup on a fresh 30-second context. A 300-file run took 14 extra seconds to exit and
+blamed 108 files that had never been touched.
+
+---
+
+## 16. A cached `destIndex` error is returned to every caller
+
+`remoteDirIndex` caches the listing behind a `sync.Once`, errors included. That is
+deliberate — one unreachable remote should not be re-probed once per file — but it
+means a transient listing failure poisons that directory for the rest of the run. The
+circuit breaker is the intended backstop; `recordRemoteFailure` is called on listing
+failures for exactly that reason.
