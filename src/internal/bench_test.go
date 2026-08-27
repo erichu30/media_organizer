@@ -73,6 +73,6 @@ func benchmarkExifPool(b *testing.B, poolSize int) {
 	})
 }
 
-func BenchmarkExifPool_Size1(b *testing.B)  { benchmarkExifPool(b, 1) }
-func BenchmarkExifPool_Size4(b *testing.B)  { benchmarkExifPool(b, 4) }
-func BenchmarkExifPool_Size8(b *testing.B)  { benchmarkExifPool(b, 8) }
+func BenchmarkExifPool_Size1(b *testing.B) { benchmarkExifPool(b, 1) }
+func BenchmarkExifPool_Size4(b *testing.B) { benchmarkExifPool(b, 4) }
+func BenchmarkExifPool_Size8(b *testing.B) { benchmarkExifPool(b, 8) }

@@ -101,10 +101,10 @@ func TestExtractDate_NoMetadata_ReturnsZeroTime(t *testing.T) {
 
 func TestParseExifDate(t *testing.T) {
 	cases := []struct {
-		name     string
-		input    string
-		want     time.Time
-		wantErr  bool
+		name    string
+		input   string
+		want    time.Time
+		wantErr bool
 	}{
 		{
 			name:  "with timezone",

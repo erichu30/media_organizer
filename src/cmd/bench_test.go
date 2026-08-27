@@ -63,19 +63,19 @@ func benchmarkCopyOld(b *testing.B, size int) {
 	}
 }
 
-func BenchmarkCopyNew_1KB(b *testing.B)    { benchmarkCopyNew(b, 1<<10) }
-func BenchmarkCopyNew_10KB(b *testing.B)   { benchmarkCopyNew(b, 10<<10) }
-func BenchmarkCopyNew_100KB(b *testing.B)  { benchmarkCopyNew(b, 100<<10) }
-func BenchmarkCopyNew_1MB(b *testing.B)    { benchmarkCopyNew(b, 1<<20) }
-func BenchmarkCopyNew_10MB(b *testing.B)   { benchmarkCopyNew(b, 10<<20) }
-func BenchmarkCopyNew_100MB(b *testing.B)  { benchmarkCopyNew(b, 100<<20) }
+func BenchmarkCopyNew_1KB(b *testing.B)   { benchmarkCopyNew(b, 1<<10) }
+func BenchmarkCopyNew_10KB(b *testing.B)  { benchmarkCopyNew(b, 10<<10) }
+func BenchmarkCopyNew_100KB(b *testing.B) { benchmarkCopyNew(b, 100<<10) }
+func BenchmarkCopyNew_1MB(b *testing.B)   { benchmarkCopyNew(b, 1<<20) }
+func BenchmarkCopyNew_10MB(b *testing.B)  { benchmarkCopyNew(b, 10<<20) }
+func BenchmarkCopyNew_100MB(b *testing.B) { benchmarkCopyNew(b, 100<<20) }
 
-func BenchmarkCopyOld_1KB(b *testing.B)    { benchmarkCopyOld(b, 1<<10) }
-func BenchmarkCopyOld_10KB(b *testing.B)   { benchmarkCopyOld(b, 10<<10) }
-func BenchmarkCopyOld_100KB(b *testing.B)  { benchmarkCopyOld(b, 100<<10) }
-func BenchmarkCopyOld_1MB(b *testing.B)    { benchmarkCopyOld(b, 1<<20) }
-func BenchmarkCopyOld_10MB(b *testing.B)   { benchmarkCopyOld(b, 10<<20) }
-func BenchmarkCopyOld_100MB(b *testing.B)  { benchmarkCopyOld(b, 100<<20) }
+func BenchmarkCopyOld_1KB(b *testing.B)   { benchmarkCopyOld(b, 1<<10) }
+func BenchmarkCopyOld_10KB(b *testing.B)  { benchmarkCopyOld(b, 10<<10) }
+func BenchmarkCopyOld_100KB(b *testing.B) { benchmarkCopyOld(b, 100<<10) }
+func BenchmarkCopyOld_1MB(b *testing.B)   { benchmarkCopyOld(b, 1<<20) }
+func BenchmarkCopyOld_10MB(b *testing.B)  { benchmarkCopyOld(b, 10<<20) }
+func BenchmarkCopyOld_100MB(b *testing.B) { benchmarkCopyOld(b, 100<<20) }
 
 // ---- collectFiles: walk overhead by collection size ----
 

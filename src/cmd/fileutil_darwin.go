@@ -9,7 +9,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-
 // attrCmnCrtime is ATTR_CMN_CRTIME from <sys/attr.h>.
 // setattrlist(2) uses it to set a file's birth (creation) timestamp on HFS+/APFS.
 const attrCmnCrtime uint32 = 0x00000200
