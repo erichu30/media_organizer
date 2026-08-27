@@ -1,2 +1,5 @@
 .DS_Store
 build/
+*.log
+*.log.1
+CLAUDE.local.md

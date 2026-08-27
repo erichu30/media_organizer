@@ -1,0 +1,44 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go test *)",
+      "Bash(go build *)",
+      "Bash(go vet *)",
+      "Bash(gofmt *)",
+      "Bash(git branch *)",
+      "Bash(git checkout *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/prevent-main-edits.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/gofmt.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/govet.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/gotest.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

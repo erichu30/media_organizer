@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -67,14 +69,14 @@ func (s *AppTestSuite) TestCollectFiles_ReturnsAllFiles() {
 	s.writeFile("a.jpg", "a")
 	s.writeFile("b.mp4", "b")
 
-	paths, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	paths, _, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(2, count)
 	s.Len(paths, 2)
 }
 
 func (s *AppTestSuite) TestCollectFiles_EmptyDir() {
-	paths, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	paths, _, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(0, count)
 	s.Empty(paths)
@@ -86,7 +88,7 @@ func (s *AppTestSuite) TestCollectFiles_NestedFiles() {
 	require.NoError(s.T(), os.WriteFile(filepath.Join(sub, "nested.jpg"), []byte("x"), 0644))
 	s.writeFile("root.jpg", "y")
 
-	_, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	_, _, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(2, count)
 }
@@ -97,7 +99,7 @@ func (s *AppTestSuite) TestCollectFiles_SkipsSpotlightDir() {
 	require.NoError(s.T(), os.WriteFile(filepath.Join(dir, "hidden.jpg"), []byte("x"), 0644))
 	s.writeFile("visible.jpg", "y")
 
-	paths, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	paths, _, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(1, count)
 	s.Contains(paths[0], "visible.jpg")
@@ -108,7 +110,7 @@ func (s *AppTestSuite) TestCollectFiles_SkipsFseventsd() {
 	require.NoError(s.T(), os.MkdirAll(dir, 0755))
 	require.NoError(s.T(), os.WriteFile(filepath.Join(dir, "event"), []byte("x"), 0644))
 
-	_, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	_, _, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(0, count)
 }
@@ -118,7 +120,7 @@ func (s *AppTestSuite) TestCollectFiles_SkipsDocumentRevisions() {
 	require.NoError(s.T(), os.MkdirAll(dir, 0755))
 	require.NoError(s.T(), os.WriteFile(filepath.Join(dir, "rev"), []byte("x"), 0644))
 
-	_, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	_, _, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(0, count)
 }
@@ -129,7 +131,7 @@ func (s *AppTestSuite) TestCollectFiles_SkipsNonMediaFiles() {
 	s.writeFile("readme.txt", "c")
 	s.writeFile("clip.mp4", "d")
 
-	paths, count, skipped := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	paths, _, count, skipped := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(2, count)
 	s.Equal(2, skipped)
@@ -143,7 +145,7 @@ func (s *AppTestSuite) TestCollectFiles_CaseInsensitiveExtension() {
 	s.writeFile("PHOTO.JPG", "a")
 	s.writeFile("clip.MP4", "b")
 
-	_, count, skipped := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
+	_, _, count, skipped := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
 	s.Equal(2, count)
 	s.Equal(0, skipped)
@@ -568,9 +570,9 @@ func TestRecordRemoteFailure_FiresAtThreshold(t *testing.T) {
 func TestRecordRemoteFailure_ResetOnSuccess(t *testing.T) {
 	app := &App{Config: &Config{RemoteFailThreshold: 3}}
 
-	app.recordRemoteFailure() // 1
-	app.recordRemoteFailure() // 2
-	app.resetRemoteFailures() // reset — next failure starts from 1 again
+	app.recordRemoteFailure()                  // 1
+	app.recordRemoteFailure()                  // 2
+	app.resetRemoteFailures()                  // reset — next failure starts from 1 again
 	assert.False(t, app.recordRemoteFailure()) // 1, not 3
 }
 
@@ -589,85 +591,35 @@ func TestRecordRemoteFailure_DisabledWhenZero(t *testing.T) {
 	assert.NoError(t, ctx.Err(), "context must not be cancelled when threshold is 0")
 }
 
-func TestRecordRemoteFailure_SubsequentCallsAfterFire(t *testing.T) {
-	cancelled := false
+// TestRecordRemoteFailure_AnnouncesOnce verifies the breaker reports itself exactly
+// once. Workers draining their in-flight transfers keep incrementing the counter,
+// and repeating the warning for each of them buries the summary.
+func TestRecordRemoteFailure_AnnouncesOnce(t *testing.T) {
+	cancelled := 0
 	app := &App{
 		Config:    &Config{RemoteFailThreshold: 2},
-		runCancel: func() { cancelled = true },
+		runCancel: func() { cancelled++ },
 	}
 
-	app.recordRemoteFailure() // 1
-	app.recordRemoteFailure() // 2 — fires
-	assert.True(t, cancelled)
-	// Additional failures after the breaker has fired must not panic.
-	assert.True(t, app.recordRemoteFailure()) // 3 — still returns true, no panic
+	assert.False(t, app.recordRemoteFailure(), "below threshold must not fire")
+	assert.True(t, app.recordRemoteFailure(), "crossing the threshold fires once")
+	assert.False(t, app.recordRemoteFailure(), "already-fired breaker must stay quiet")
+	assert.False(t, app.recordRemoteFailure(), "and must not panic on later failures")
+	assert.Equal(t, 1, cancelled, "the run is cancelled exactly once")
 }
 
-// ---- isRclonePath / isSFTPPath / toRcloneSFTPPath ----
+// ---- collectFiles: sizes ----
 
-func TestIsSFTPPath(t *testing.T) {
-	cases := []struct {
-		in   string
-		want bool
-	}{
-		{"root@192.168.0.83:/mnt/photos", true},
-		{"user@host:path", true},
-		{"remotename:/path", false},  // rclone remote, no @
-		{"/local/path", false},       // plain local
-		{"C:\\Windows\\path", false}, // Windows-style local
-		{"@missinguser:path", false}, // @ at index 0
-	}
-	for _, tc := range cases {
-		t.Run(tc.in, func(t *testing.T) {
-			assert.Equal(t, tc.want, isSFTPPath(tc.in))
-		})
-	}
-}
+func (s *AppTestSuite) TestCollectFiles_ReturnsSizes() {
+	s.writeFile("a.jpg", "hello")  // 5 bytes
+	s.writeFile("b.mp4", "world!") // 6 bytes
 
-func TestToRcloneSFTPPath(t *testing.T) {
-	cases := []struct {
-		in      string
-		keyFile string
-		want    string
-	}{
-		{
-			"root@192.168.0.83:/mnt/naspool/photo", "",
-			":sftp,host=192.168.0.83,user=root:/mnt/naspool/photo",
-		},
-		{
-			"alice@nas:backup", "",
-			":sftp,host=nas,user=alice:backup",
-		},
-		{
-			"root@192.168.0.83:/mnt/photos", "/home/user/.ssh/id_ed25519",
-			":sftp,host=192.168.0.83,user=root,key_file=/home/user/.ssh/id_ed25519:/mnt/photos",
-		},
-		// non-SFTP paths are returned unchanged
-		{"remotename:/path", "", "remotename:/path"},
-		{"/local/path", "", "/local/path"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.in, func(t *testing.T) {
-			assert.Equal(t, tc.want, toRcloneSFTPPath(tc.in, tc.keyFile))
-		})
-	}
-}
+	_, sizes, count, _ := s.appWith(&Config{InputPath: s.tmpDir}, nil).collectFiles()
 
-func TestIsRclonePath(t *testing.T) {
-	cases := []struct {
-		in   string
-		want bool
-	}{
-		{"myremote:/photos", true},              // standard rclone remote
-		{"root@192.168.0.83:/mnt/p", true},     // SSH-style → treated as rclone SFTP
-		{"user@host:path", true},               // SSH-style without leading /
-		{"/local/path", false},                 // plain local
-		{"relative/path", false},               // no colon
-	}
-	for _, tc := range cases {
-		t.Run(tc.in, func(t *testing.T) {
-			assert.Equal(t, tc.want, isRclonePath(tc.in))
-		})
+	s.Equal(2, count)
+	s.Len(sizes, 2)
+	for _, sz := range sizes {
+		s.Positive(sz, "size must be > 0 for non-empty files")
 	}
 }
 
@@ -683,4 +635,129 @@ func (s *AppTestSuite) noFile(path string, msgAndArgs ...interface{}) {
 	s.T().Helper()
 	_, err := os.Stat(path)
 	s.True(os.IsNotExist(err), append([]interface{}{"expected file to be absent: %s", path}, msgAndArgs...)...)
+}
+
+// ---- worker: cancellation drains without pretending to fail ----
+
+// TestWorker_CancelledJobsAreNotFailures covers what Ctrl-C used to do to a remote
+// run: the feeder stopped queueing, but every file already in the channel was still
+// attempted, failed instantly against the cancelled context, and paid for a remote
+// cleanup on the way out. The result was a minutes-long exit and a summary blaming
+// a queue's worth of files that had never been touched.
+func (s *AppTestSuite) TestWorker_CancelledJobsAreNotFailures() {
+	svc := new(MockExifService)
+	svc.On("ExtractDate", mock.AnythingOfType("string"), false, false).
+		Return(time.Time{}, "", nil).Maybe()
+
+	app := s.appWith(&Config{OutputPath: s.tmpDir, OnConflict: ConflictRename}, svc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	jobs := make(chan string, 5)
+	for i := range 5 {
+		jobs <- fmt.Sprintf("queued%02d.jpg", i)
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go app.worker(ctx, 1, jobs, &wg, progressbar.NewOptions(5, progressbar.OptionSetWriter(io.Discard)))
+	wg.Wait()
+
+	s.Equal(int64(5), app.stats.cancelled.Load(), "queued-but-unreached files are cancelled")
+	s.Zero(app.stats.totalFailed(), "cancelled files must not be counted as failures")
+	s.Zero(app.stats.success.Load())
+	svc.AssertNotCalled(s.T(), "ExtractDate", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// ---- summary counters ----
+
+func TestStatsPrint_ConflictCounters(t *testing.T) {
+	var s Stats
+	s.addRenamed()
+	s.addAlreadyPresent()
+	s.addSkippedConflict()
+	s.addCancelled()
+
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	s.print(4, 0, false)
+	w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	out := buf.String()
+
+	assert.Contains(t, out, "Renamed")
+	assert.Contains(t, out, "Already there")
+	assert.Contains(t, out, "Conflicts skipped")
+}
+
+// TestStatsPrint_AccountsForEveryFile checks the summary adds up. An interrupted run
+// leaves most files undispatched, and without this line they show up nowhere —
+// making a run that moved 24 of 300 files look like it had nothing left to do.
+func TestStatsPrint_AccountsForEveryFile(t *testing.T) {
+	capture := func(s *Stats, total int) string {
+		r, w, _ := os.Pipe()
+		old := os.Stdout
+		os.Stdout = w
+		s.print(total, 0, true)
+		w.Close()
+		os.Stdout = old
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		return buf.String()
+	}
+
+	t.Run("undispatched files are reported", func(t *testing.T) {
+		var s Stats
+		for range 24 {
+			s.addSuccess()
+		}
+		out := capture(&s, 300)
+		assert.Contains(t, out, "Not attempted : 276")
+	})
+
+	t.Run("a complete run reports no remainder", func(t *testing.T) {
+		var s Stats
+		for range 3 {
+			s.addSuccess()
+		}
+		assert.NotContains(t, capture(&s, 3), "Not attempted")
+	})
+}
+
+// TestPrintHints_SuggestsFileModifyDateFallback checks the hint that turns a wall of
+// "no EXIF date" failures into the one flag that fixes most of them.
+func TestPrintHints_SuggestsFileModifyDateFallback(t *testing.T) {
+	capture := func(app *App) string {
+		r, w, _ := os.Pipe()
+		old := os.Stdout
+		os.Stdout = w
+		app.printHints()
+		w.Close()
+		os.Stdout = old
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		return buf.String()
+	}
+
+	t.Run("suggested when the fallback is off", func(t *testing.T) {
+		app := &App{Config: &Config{LogPath: defaultLogPath}}
+		app.stats.addFailure("no EXIF date")
+		assert.Contains(t, capture(app), "-use-file-modify-date")
+	})
+
+	t.Run("not repeated when the fallback is already on", func(t *testing.T) {
+		app := &App{Config: &Config{LogPath: defaultLogPath, UseFileModifyDate: true}}
+		app.stats.addFailure("no EXIF date")
+		assert.NotContains(t, capture(app), "-use-file-modify-date")
+	})
+
+	t.Run("silent on a clean run", func(t *testing.T) {
+		app := &App{Config: &Config{LogPath: defaultLogPath}}
+		assert.Empty(t, capture(app))
+	})
 }

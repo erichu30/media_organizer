@@ -154,27 +154,8 @@ func TestValidatePaths_LocalOutputCreationFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to create or access output directory")
 }
 
-func TestValidatePaths_RemoteMissingTools(t *testing.T) {
-	tmp := t.TempDir()
-	inDir := filepath.Join(tmp, "input")
-	require.NoError(t, os.Mkdir(inDir, 0755))
-
-	cfg := &Config{
-		InputPath:  inDir,
-		OutputPath: "myremote:/path",
-		IsRemote:   true,
-	}
-
-	// Clear PATH temporarily to simulate missing rclone
-	origPath := os.Getenv("PATH")
-	defer os.Setenv("PATH", origPath)
-	os.Setenv("PATH", "")
-
-	err := validatePaths(cfg)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "command not found")
-}
-
+// TestValidatePaths_RemoteNeedsNoLocalDir confirms a remote destination is not
+// created on the local disk — rclone makes what it needs at the far end.
 func TestValidatePaths_RemoteSuccess(t *testing.T) {
 	tmp := t.TempDir()
 	inDir := filepath.Join(tmp, "input")
@@ -186,10 +167,257 @@ func TestValidatePaths_RemoteSuccess(t *testing.T) {
 		IsRemote:   true,
 	}
 
-	if _, err := exec.LookPath("rclone"); err != nil {
-		t.Skip("rclone not found in PATH, skipping remote success test")
+	assert.NoError(t, validatePaths(cfg))
+	assert.NoDirExists(t, filepath.Join(tmp, "myremote:"))
+}
+
+// ---- validateDependencies ----
+
+// TestValidateDependencies_MissingTools checks both binaries are reported by name.
+// They live outside validatePaths on purpose: when this check ran first inside it, a
+// machine without exiftool got "exiftool not found" for every bad path too, and the
+// real problem stayed hidden.
+func TestValidateDependencies_MissingTools(t *testing.T) {
+	cases := []struct {
+		name     string
+		isRemote bool
+		wantMsg  string
+	}{
+		{"local run still needs exiftool", false, "exiftool command not found"},
+		{"remote run needs exiftool first", true, "exiftool command not found"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PATH", "")
+
+			err := validateDependencies(&Config{OutputPath: "myremote:/path", IsRemote: tc.isRemote})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMsg)
+		})
+	}
+}
+
+// TestValidateDependencies_RemoteNeedsRclone isolates the rclone branch by putting a
+// stub exiftool on PATH, so the test does not depend on the host having either tool.
+func TestValidateDependencies_RemoteNeedsRclone(t *testing.T) {
+	stubDir := t.TempDir()
+	stub := filepath.Join(stubDir, "exiftool")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0755))
+	t.Setenv("PATH", stubDir)
+
+	err := validateDependencies(&Config{OutputPath: "myremote:/path", IsRemote: true})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rclone command not found")
+
+	// The same stub PATH is fine for a local run, which needs no rclone.
+	assert.NoError(t, validateDependencies(&Config{OutputPath: "/tmp/out"}))
+}
+
+func TestValidateDependencies_AllPresent(t *testing.T) {
+	for _, bin := range []string{"exiftool", "rclone"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not found in PATH", bin)
+		}
+	}
+	assert.NoError(t, validateDependencies(&Config{OutputPath: "myremote:/path", IsRemote: true}))
+}
+
+// ---- isSFTPPath / toRcloneSFTPPath / isRclonePath ----
+
+func TestIsSFTPPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"root@192.168.0.83:/mnt/photos", true},
+		{"user@host:path", true},
+		{"remotename:/path", false},  // rclone remote, no @
+		{"/local/path", false},       // plain local
+		{"C:\\Windows\\path", false}, // Windows-style local
+		{"@missinguser:path", false}, // @ at index 0
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, isSFTPPath(tc.in))
+		})
+	}
+}
+
+func TestToRcloneSFTPPath(t *testing.T) {
+	cases := []struct {
+		in      string
+		keyFile string
+		want    string
+	}{
+		{
+			"root@192.168.0.83:/mnt/naspool/photo", "",
+			":sftp,host=192.168.0.83,user=root:/mnt/naspool/photo",
+		},
+		{
+			"alice@nas:backup", "",
+			":sftp,host=nas,user=alice:backup",
+		},
+		{
+			"root@192.168.0.83:/mnt/photos", "/home/user/.ssh/id_ed25519",
+			":sftp,host=192.168.0.83,user=root,key_file=/home/user/.ssh/id_ed25519:/mnt/photos",
+		},
+		{"remotename:/path", "", "remotename:/path"},
+		{"/local/path", "", "/local/path"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, toRcloneSFTPPath(tc.in, tc.keyFile))
+		})
+	}
+}
+
+func TestIsRclonePath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"myremote:/photos", true},
+		{"root@192.168.0.83:/mnt/p", true},
+		{"user@host:path", true},
+		{"/local/path", false},
+		{"relative/path", false},
+		// A colon inside a local path does not make it a remote. Treating these as
+		// rclone destinations sent the whole run to a remote name that never existed.
+		{"/Volumes/Trips/2024:Japan", false},
+		{"./out:staging", false},
+		{"~/Pictures/2024:trip", false},
+		{"photos:2024/sorted", true}, // bare token before the colon — a real remote
+		{"C:\\Users\\me\\Photos", false},
+		{"D:/Photos", false},
+		{":memory", false}, // empty remote name
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, isRclonePath(tc.in))
+		})
+	}
+}
+
+// ---- validateConfig ----
+
+// TestValidateConfig_Defaults confirms an untouched config passes, so the checks
+// below are rejecting bad input rather than the defaults.
+func TestValidateConfig_Defaults(t *testing.T) {
+	resetFlags(t, []string{"-i", "/input", "-o", "/output"})
+	assert.NoError(t, validateConfig(NewConfig()))
+}
+
+// TestValidateConfig_RejectsUnusableValues covers the flag values that used to fail
+// only at run time: -workers 0 hung forever with an empty screen, and a negative
+// -buffer panicked inside make(chan).
+func TestValidateConfig_RejectsUnusableValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantMsg string
+	}{
+		{"zero workers", func(c *Config) { c.Workers = 0 }, "-workers"},
+		{"negative workers", func(c *Config) { c.Workers = -3 }, "-workers"},
+		{"too many workers", func(c *Config) { c.Workers = maxWorkers + 1 }, "-workers"},
+		{"negative buffer", func(c *Config) { c.Buffer = -1 }, "-buffer"},
+		{"negative retries", func(c *Config) { c.Retries = -1 }, "-retries"},
+		{"negative threshold", func(c *Config) { c.RemoteFailThreshold = -1 }, "-remote-fail-threshold"},
+		{"unknown conflict policy", func(c *Config) { c.OnConflict = "clobber" }, "-on-conflict"},
+		{"empty log path", func(c *Config) { c.LogPath = "" }, "-log"},
+		{"estimate on local dest", func(c *Config) { c.EstimateTransfer = true }, "-estimate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				InputPath: "/input", OutputPath: "/output",
+				Workers: 8, Buffer: 100, Retries: 3,
+				RemoteFailThreshold: 5, OnConflict: ConflictRename, LogPath: defaultLogPath,
+			}
+			tc.mutate(cfg)
+
+			err := validateConfig(cfg)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMsg)
+		})
+	}
+}
+
+func TestValidateConfig_EstimateAllowedOnRemote(t *testing.T) {
+	cfg := &Config{
+		InputPath: "/input", OutputPath: "remote:/photos", IsRemote: true,
+		Workers: 8, Buffer: 100, Retries: 3,
+		RemoteFailThreshold: 5, OnConflict: ConflictRename, LogPath: defaultLogPath,
+		EstimateTransfer: true,
+	}
+	assert.NoError(t, validateConfig(cfg))
+}
+
+// ---- new flags ----
+
+func TestNewConfig_ConflictAndLogFlags(t *testing.T) {
+	resetFlags(t, []string{"-i", "/in", "-o", "/out", "-on-conflict", "skip", "-log", "/tmp/run.log"})
+	cfg := NewConfig()
+
+	assert.Equal(t, ConflictSkip, cfg.OnConflict)
+	assert.Equal(t, "/tmp/run.log", cfg.LogPath)
+}
+
+func TestNewConfig_ConflictDefaultsToRename(t *testing.T) {
+	resetFlags(t, []string{"-i", "/in", "-o", "/out"})
+	cfg := NewConfig()
+
+	assert.Equal(t, ConflictRename, cfg.OnConflict, "the default must never lose a file")
+	assert.Equal(t, defaultLogPath, cfg.LogPath)
+}
+
+// ---- log rotation ----
+
+func TestRotateLogIfLarge(t *testing.T) {
+	t.Run("small log is left alone", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "run.log")
+		require.NoError(t, os.WriteFile(path, []byte("short"), 0644))
+
+		rotateLogIfLarge(path)
+
+		assert.FileExists(t, path)
+		assert.NoFileExists(t, path+".1")
+	})
+
+	t.Run("oversized log is rotated", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "run.log")
+		require.NoError(t, os.WriteFile(path, make([]byte, maxLogBytes+1), 0644))
+
+		rotateLogIfLarge(path)
+
+		assert.NoFileExists(t, path)
+		assert.FileExists(t, path+".1")
+	})
+
+	t.Run("missing log is not an error", func(t *testing.T) {
+		assert.NotPanics(t, func() { rotateLogIfLarge(filepath.Join(t.TempDir(), "absent.log")) })
+	})
+}
+
+// ---- excluded directories ----
+
+// TestIsExcludedDir covers the directories that are full of media-extension files
+// that are not the user's photos — a Synology @eaDir holds one SYNOPHOTO_THUMB_*.jpg
+// per real photo, and a Photos library bundle comes apart if it is reorganized.
+func TestIsExcludedDir(t *testing.T) {
+	excluded := []string{
+		".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100", ".Trashes",
+		"@eaDir", "#recycle", "$RECYCLE.BIN", ".git",
+		"Photos Library.photoslibrary", "Trip.LRDATA",
+	}
+	for _, name := range excluded {
+		t.Run(name, func(t *testing.T) { assert.True(t, isExcludedDir(name)) })
 	}
 
-	err := validatePaths(cfg)
-	assert.NoError(t, err)
+	kept := []string{"2023", "05", "Holidays", "photos", "eaDir", "library"}
+	for _, name := range kept {
+		t.Run("keeps "+name, func(t *testing.T) { assert.False(t, isExcludedDir(name)) })
+	}
 }
