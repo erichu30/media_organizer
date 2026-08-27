@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -568,9 +570,9 @@ func TestRecordRemoteFailure_FiresAtThreshold(t *testing.T) {
 func TestRecordRemoteFailure_ResetOnSuccess(t *testing.T) {
 	app := &App{Config: &Config{RemoteFailThreshold: 3}}
 
-	app.recordRemoteFailure() // 1
-	app.recordRemoteFailure() // 2
-	app.resetRemoteFailures() // reset — next failure starts from 1 again
+	app.recordRemoteFailure()                  // 1
+	app.recordRemoteFailure()                  // 2
+	app.resetRemoteFailures()                  // reset — next failure starts from 1 again
 	assert.False(t, app.recordRemoteFailure()) // 1, not 3
 }
 
@@ -589,18 +591,21 @@ func TestRecordRemoteFailure_DisabledWhenZero(t *testing.T) {
 	assert.NoError(t, ctx.Err(), "context must not be cancelled when threshold is 0")
 }
 
-func TestRecordRemoteFailure_SubsequentCallsAfterFire(t *testing.T) {
-	cancelled := false
+// TestRecordRemoteFailure_AnnouncesOnce verifies the breaker reports itself exactly
+// once. Workers draining their in-flight transfers keep incrementing the counter,
+// and repeating the warning for each of them buries the summary.
+func TestRecordRemoteFailure_AnnouncesOnce(t *testing.T) {
+	cancelled := 0
 	app := &App{
 		Config:    &Config{RemoteFailThreshold: 2},
-		runCancel: func() { cancelled = true },
+		runCancel: func() { cancelled++ },
 	}
 
-	app.recordRemoteFailure() // 1
-	app.recordRemoteFailure() // 2 — fires
-	assert.True(t, cancelled)
-	// Additional failures after the breaker has fired must not panic.
-	assert.True(t, app.recordRemoteFailure()) // 3 — still returns true, no panic
+	assert.False(t, app.recordRemoteFailure(), "below threshold must not fire")
+	assert.True(t, app.recordRemoteFailure(), "crossing the threshold fires once")
+	assert.False(t, app.recordRemoteFailure(), "already-fired breaker must stay quiet")
+	assert.False(t, app.recordRemoteFailure(), "and must not panic on later failures")
+	assert.Equal(t, 1, cancelled, "the run is cancelled exactly once")
 }
 
 // ---- collectFiles: sizes ----
@@ -630,4 +635,129 @@ func (s *AppTestSuite) noFile(path string, msgAndArgs ...interface{}) {
 	s.T().Helper()
 	_, err := os.Stat(path)
 	s.True(os.IsNotExist(err), append([]interface{}{"expected file to be absent: %s", path}, msgAndArgs...)...)
+}
+
+// ---- worker: cancellation drains without pretending to fail ----
+
+// TestWorker_CancelledJobsAreNotFailures covers what Ctrl-C used to do to a remote
+// run: the feeder stopped queueing, but every file already in the channel was still
+// attempted, failed instantly against the cancelled context, and paid for a remote
+// cleanup on the way out. The result was a minutes-long exit and a summary blaming
+// a queue's worth of files that had never been touched.
+func (s *AppTestSuite) TestWorker_CancelledJobsAreNotFailures() {
+	svc := new(MockExifService)
+	svc.On("ExtractDate", mock.AnythingOfType("string"), false, false).
+		Return(time.Time{}, "", nil).Maybe()
+
+	app := s.appWith(&Config{OutputPath: s.tmpDir, OnConflict: ConflictRename}, svc)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	jobs := make(chan string, 5)
+	for i := range 5 {
+		jobs <- fmt.Sprintf("queued%02d.jpg", i)
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go app.worker(ctx, 1, jobs, &wg, progressbar.NewOptions(5, progressbar.OptionSetWriter(io.Discard)))
+	wg.Wait()
+
+	s.Equal(int64(5), app.stats.cancelled.Load(), "queued-but-unreached files are cancelled")
+	s.Zero(app.stats.totalFailed(), "cancelled files must not be counted as failures")
+	s.Zero(app.stats.success.Load())
+	svc.AssertNotCalled(s.T(), "ExtractDate", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// ---- summary counters ----
+
+func TestStatsPrint_ConflictCounters(t *testing.T) {
+	var s Stats
+	s.addRenamed()
+	s.addAlreadyPresent()
+	s.addSkippedConflict()
+	s.addCancelled()
+
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	s.print(4, 0, false)
+	w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	out := buf.String()
+
+	assert.Contains(t, out, "Renamed")
+	assert.Contains(t, out, "Already there")
+	assert.Contains(t, out, "Conflicts skipped")
+}
+
+// TestStatsPrint_AccountsForEveryFile checks the summary adds up. An interrupted run
+// leaves most files undispatched, and without this line they show up nowhere —
+// making a run that moved 24 of 300 files look like it had nothing left to do.
+func TestStatsPrint_AccountsForEveryFile(t *testing.T) {
+	capture := func(s *Stats, total int) string {
+		r, w, _ := os.Pipe()
+		old := os.Stdout
+		os.Stdout = w
+		s.print(total, 0, true)
+		w.Close()
+		os.Stdout = old
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		return buf.String()
+	}
+
+	t.Run("undispatched files are reported", func(t *testing.T) {
+		var s Stats
+		for range 24 {
+			s.addSuccess()
+		}
+		out := capture(&s, 300)
+		assert.Contains(t, out, "Not attempted : 276")
+	})
+
+	t.Run("a complete run reports no remainder", func(t *testing.T) {
+		var s Stats
+		for range 3 {
+			s.addSuccess()
+		}
+		assert.NotContains(t, capture(&s, 3), "Not attempted")
+	})
+}
+
+// TestPrintHints_SuggestsFileModifyDateFallback checks the hint that turns a wall of
+// "no EXIF date" failures into the one flag that fixes most of them.
+func TestPrintHints_SuggestsFileModifyDateFallback(t *testing.T) {
+	capture := func(app *App) string {
+		r, w, _ := os.Pipe()
+		old := os.Stdout
+		os.Stdout = w
+		app.printHints()
+		w.Close()
+		os.Stdout = old
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		return buf.String()
+	}
+
+	t.Run("suggested when the fallback is off", func(t *testing.T) {
+		app := &App{Config: &Config{LogPath: defaultLogPath}}
+		app.stats.addFailure("no EXIF date")
+		assert.Contains(t, capture(app), "-use-file-modify-date")
+	})
+
+	t.Run("not repeated when the fallback is already on", func(t *testing.T) {
+		app := &App{Config: &Config{LogPath: defaultLogPath, UseFileModifyDate: true}}
+		app.stats.addFailure("no EXIF date")
+		assert.NotContains(t, capture(app), "-use-file-modify-date")
+	})
+
+	t.Run("silent on a clean run", func(t *testing.T) {
+		app := &App{Config: &Config{LogPath: defaultLogPath}}
+		assert.Empty(t, capture(app))
+	})
 }

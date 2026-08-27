@@ -8,11 +8,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
 )
+
+// reasonSkipped is returned with a nil error when processFile deliberately did not
+// transfer a file — it was already at the destination, or -on-conflict=skip left it
+// alone. The worker must not count these as successes: processFile has already put
+// them in their own counter, and counting them twice makes the summary add up to
+// more files than the run found.
+const reasonSkipped = "skipped"
 
 // processFile handles a single file: extract date, determine destination, move/copy.
 // Returns a short failure-reason string (empty on success) alongside any error.
@@ -25,12 +33,57 @@ func (app *App) processFile(ctx context.Context, path string) (string, error) {
 
 	year := fmt.Sprintf("%04d", t.Year())
 	month := fmt.Sprintf("%02d", int(t.Month()))
-	var targetDir string
+
+	var targetDir, targetPath string
 	if app.Config.IsRemote {
 		// rclone creates destination directories automatically; no mkdir step needed.
 		targetDir = app.Config.OutputPath + "/" + year + "/" + month
+		targetPath = targetDir + "/" + filepath.Base(path)
 	} else {
 		targetDir = filepath.Join(app.Config.OutputPath, year, month)
+		targetPath = filepath.Join(targetDir, filepath.Base(path))
+	}
+
+	finalPath, action, reason, err := app.resolveTarget(ctx, path, targetDir, targetPath)
+	if err != nil {
+		// A dry run is a preview, not a transfer: an unreachable destination should
+		// not stop it from reporting what it would have done.
+		if !app.Config.DryRun {
+			if errors.Is(err, errListDest) {
+				app.reportDestListError(targetDir, err)
+				// A destination that cannot be listed will not accept transfers
+				// either, so let the circuit breaker end the run early.
+				app.recordRemoteFailure()
+			}
+			return reason, err
+		}
+		logrus.Warnf("[DRY-RUN] cannot check destination for %s: %v", path, err)
+		finalPath, action = targetPath, actionTransfer
+	}
+
+	switch action {
+	case actionSkipIdentical:
+		logrus.Infof("Already at destination, skipping: %s (matches %s)", path, finalPath)
+		app.stats.addAlreadyPresent()
+		return reasonSkipped, nil
+	case actionSkipConflict:
+		logrus.Infof("Destination exists, skipping (-on-conflict=skip): %s → %s", path, finalPath)
+		app.stats.addSkippedConflict()
+		return reasonSkipped, nil
+	}
+	if finalPath != targetPath {
+		logrus.Infof("Name conflict: %s renamed to %s", targetPath, app.destBase(finalPath))
+		app.stats.addRenamed()
+	}
+
+	if app.Config.DryRun {
+		logrus.Infof("[DRY-RUN] Move: %s → %s (copy=%v)", path, finalPath, app.Config.CopyMode)
+		return "", nil
+	}
+
+	// Created only once the transfer is actually going to happen, so a dry run
+	// leaves no empty YYYY/MM directories behind.
+	if !app.Config.IsRemote {
 		if _, loaded := app.dirCache.Load(targetDir); !loaded {
 			if err := os.MkdirAll(targetDir, os.ModePerm); err != nil {
 				return "directory creation failed", fmt.Errorf("failed to create dir %s: %w", targetDir, err)
@@ -39,27 +92,15 @@ func (app *App) processFile(ctx context.Context, path string) (string, error) {
 		}
 	}
 
-	var targetPath string
-	if app.Config.IsRemote {
-		targetPath = app.Config.OutputPath + "/" + year + "/" + month + "/" + filepath.Base(path)
-	} else {
-		targetPath = filepath.Join(targetDir, filepath.Base(path))
-	}
-
-	if app.Config.DryRun {
-		logrus.Infof("[DRY-RUN] Move: %s → %s (copy=%v)", path, targetPath, app.Config.CopyMode)
-		return "", nil
-	}
-
-	logrus.Infof("Move: %s → %s (copy=%v)", path, targetPath, app.Config.CopyMode)
+	logrus.Infof("Move: %s → %s (copy=%v)", path, finalPath, app.Config.CopyMode)
 	if app.Config.Debug {
-		logrus.Debugf("%s → %s (copy=%v)", path, targetPath, app.Config.CopyMode)
+		logrus.Debugf("%s → %s (copy=%v)", path, finalPath, app.Config.CopyMode)
 	}
 
 	if app.Config.IsRemote {
-		return app.transferRemote(ctx, path, targetPath)
+		return app.transferRemote(ctx, path, finalPath)
 	}
-	return app.transferLocal(ctx, path, targetPath)
+	return app.transferLocal(ctx, path, finalPath)
 }
 
 // extractDate extracts the creation date from a file's EXIF metadata.
@@ -123,7 +164,56 @@ func (app *App) transferRemote(ctx context.Context, src, dst string) (string, er
 	}
 
 	app.recordRemoteFailure()
+	app.reportRemoteError(src, err, string(output))
 	return "file operation failed", fmt.Errorf("rclone %s %s: %w, output: %s", subCmd, src, err, string(output))
+}
+
+// reportRemoteError shows the first rclone failure of a run on stderr, with the
+// command's own output. Later failures go only to the log.
+//
+// Without this the terminal shows "file operation failed: 300" and nothing else,
+// while the one line that explains it — a remote name that is not in the config, a
+// rejected SSH key — sits in the log file the user has no reason to open yet. One
+// worked example is enough to diagnose it; 300 copies would bury the summary.
+func (app *App) reportRemoteError(src string, err error, output string) {
+	if !app.remoteErrShown.CompareAndSwap(false, true) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\nrclone failed on %s: %v\n", src, err)
+	for _, line := range firstLines(output, 3) {
+		fmt.Fprintf(os.Stderr, "  %s\n", line)
+	}
+	fmt.Fprintf(os.Stderr, "  (further rclone errors go to %s)\n\n", app.Config.LogPath)
+}
+
+// reportDestListError shows the first destination-listing failure of a run. A bad
+// remote now fails here rather than at transfer time, so this path needs the same
+// treatment as reportRemoteError or the cause disappears again.
+func (app *App) reportDestListError(dir string, err error) {
+	if !app.remoteErrShown.CompareAndSwap(false, true) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\nCould not read the destination %s:\n", dir)
+	for _, line := range firstLines(err.Error(), 3) {
+		fmt.Fprintf(os.Stderr, "  %s\n", line)
+	}
+	fmt.Fprintf(os.Stderr, "  Check the remote name with: rclone listremotes\n")
+	fmt.Fprintf(os.Stderr, "  (further errors go to %s)\n\n", app.Config.LogPath)
+}
+
+// firstLines returns up to n non-blank lines of s.
+func firstLines(s string, n int) []string {
+	var out []string
+	for line := range strings.SplitSeq(s, "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		out = append(out, line)
+		if len(out) == n {
+			break
+		}
+	}
+	return out
 }
 
 // cleanupRemoteFile attempts rclone deletefile on dst using a fresh 30-second context.
@@ -146,6 +236,12 @@ func (app *App) recordRemoteFailure() bool {
 	n := app.consRemoteFailures.Add(1)
 	threshold := int64(app.Config.RemoteFailThreshold)
 	if threshold <= 0 || n < threshold {
+		return false
+	}
+	// Only the first crossing announces itself. Workers still finishing their
+	// in-flight transfers keep incrementing the counter, and each one used to repeat
+	// this line — a hundred near-identical warnings scrolling past the summary.
+	if !app.breakerFired.CompareAndSwap(false, true) {
 		return false
 	}
 	msg := fmt.Sprintf("circuit breaker: %d consecutive remote failures — aborting remaining transfers", n)

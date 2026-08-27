@@ -30,6 +30,43 @@ func isMediaFile(path string) bool {
 	return ok
 }
 
+// excludedDirs are directories whose contents are never the user's media, even
+// though they are full of files with media extensions. Walking into a Synology
+// @eaDir scatters SYNOPHOTO_THUMB_*.jpg thumbnails across the output tree, and
+// walking into a trash folder resurrects deleted photos.
+var excludedDirs = map[string]struct{}{
+	// macOS
+	".DocumentRevisions-V100": {}, ".Spotlight-V100": {}, ".fseventsd": {},
+	".TemporaryItems": {}, ".Trashes": {},
+	// Synology / QNAP NAS
+	"@eaDir": {}, "#recycle": {}, "#snapshot": {}, "@Recycle": {},
+	// Windows
+	"$RECYCLE.BIN": {}, "System Volume Information": {},
+	// Version control and thumbnail caches
+	".git": {}, ".thumbnails": {},
+}
+
+// excludedDirSuffixes are bundle extensions that look like directories but are
+// managed libraries. Organizing their innards takes the library apart.
+var excludedDirSuffixes = []string{
+	".photoslibrary", ".photolibrary", ".aplibrary", ".migratedphotolibrary",
+	".lrdata", ".lrlibrary", ".fcpbundle", ".theater",
+}
+
+// isExcludedDir reports whether a directory should not be descended into.
+func isExcludedDir(name string) bool {
+	if _, ok := excludedDirs[name]; ok {
+		return true
+	}
+	lower := strings.ToLower(name)
+	for _, suffix := range excludedDirSuffixes {
+		if strings.HasSuffix(lower, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // osRename is a variable so tests can inject a fake EXDEV error without needing two real filesystems.
 var osRename = os.Rename
 

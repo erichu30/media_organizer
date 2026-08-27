@@ -26,12 +26,38 @@ func (app *App) printPreRunInfo(ctx context.Context, paths []string, sizes []int
 	if skipped > 0 {
 		fmt.Printf("  Skipped    : %d non-media files\n", skipped)
 	}
+	fmt.Printf("  Mode       : %s to %s destination (on conflict: %s)\n",
+		transferVerb(app.Config), destKind(app.Config), app.Config.OnConflict)
+	if app.Config.DryRun {
+		fmt.Printf("  Dry run    : nothing will be moved, copied, or deleted\n")
+	}
 	if app.Config.IsRemote && app.Config.EstimateTransfer && !app.Config.DryRun && len(paths) > 0 {
 		app.probeAndEstimate(ctx, paths, sizes, totalBytes)
 	} else if app.Config.IsRemote && !app.Config.EstimateTransfer {
 		fmt.Printf("  (add -estimate to measure destination speed)\n")
 	}
+	if total == 0 {
+		fmt.Printf("  No media files found under %s — nothing to do.\n", app.Config.InputPath)
+	}
 	fmt.Println()
+}
+
+// transferVerb names what the run will do to the source files, so "move" — which
+// deletes the originals — is stated up front rather than inferred from the absence
+// of -copy.
+func transferVerb(config *Config) string {
+	if config.CopyMode {
+		return "copy"
+	}
+	return "move"
+}
+
+// destKind names the kind of destination the run is writing to.
+func destKind(config *Config) string {
+	if config.IsRemote {
+		return "remote"
+	}
+	return "local"
 }
 
 // probeAndEstimate transfers two sample files (10th and 90th percentile by size) to the

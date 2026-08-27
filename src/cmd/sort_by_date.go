@@ -38,19 +38,33 @@ func run() int {
 
 	config := NewConfig()
 	if config.InputPath == "" || config.OutputPath == "" {
-		logrus.Fatal("Input (-i) and output (-o) directories are required")
+		fmt.Fprintf(os.Stderr, "Error: both -i (input) and -o (output) are required\n\n")
+		showHelp()
+		return 2
+	}
+	if err := validateConfig(config); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n\nRun %s -h for usage.\n", err, os.Args[0])
+		return 2
 	}
 
-	setupLogging(config.Debug)
+	if err := setupLogging(config); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return 1
+	}
 
+	// Past this point logrus writes to the log file, so every user-facing failure
+	// has to be printed to stderr as well or the terminal shows nothing at all.
 	if err := validatePaths(config); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
-		logrus.Fatal(err)
+		logrus.Error(err)
+		return 1
 	}
 
 	pool, err := internal.NewExifToolPool(config.Workers)
 	if err != nil {
-		logrus.Fatalf("Failed to initialize ExifToolPool: %v", err)
+		fmt.Fprintln(os.Stderr, "Error: failed to start exiftool:", err)
+		logrus.Errorf("Failed to initialize ExifToolPool: %v", err)
+		return 1
 	}
 	defer pool.Close()
 
@@ -78,17 +92,28 @@ func run() int {
 		}
 	}
 
-	if app.Run(ctx) {
+	interrupted := app.Run(ctx)
+
+	// Anything short of "every file arrived" is a non-zero exit. A cron job or shell
+	// script has no other way to notice that a run moved nothing at all.
+	if interrupted || app.stats.totalFailed() > 0 {
 		return 1
 	}
 	return 0
 }
 
-// setupLogging configures logrus to write to sortbydate.log in the working directory.
-func setupLogging(debug bool) {
-	logFile, err := os.OpenFile("sortbydate.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+// maxLogBytes is the size at which the log file is rotated. Without a cap the log
+// grows for the life of the install — it is append-only and one line per file.
+const maxLogBytes = 50 << 20
+
+// setupLogging points logrus at the configured log file, rotating it first if it
+// has grown past maxLogBytes.
+func setupLogging(config *Config) error {
+	rotateLogIfLarge(config.LogPath)
+
+	logFile, err := os.OpenFile(config.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		logrus.Fatalf("Failed to open log file: %v", err)
+		return fmt.Errorf("failed to open log file %s: %w", config.LogPath, err)
 	}
 	logrus.SetOutput(logFile)
 	logrus.SetFormatter(&logrus.TextFormatter{
@@ -97,9 +122,21 @@ func setupLogging(debug bool) {
 		ForceQuote:      false,
 		PadLevelText:    true,
 	})
-	if debug {
+	if config.Debug {
 		logrus.SetLevel(logrus.DebugLevel)
 	} else {
 		logrus.SetLevel(logrus.InfoLevel)
 	}
+	return nil
+}
+
+// rotateLogIfLarge renames an oversized log to "<path>.1", replacing any previous
+// rotation. Failures are ignored: a log that cannot be rotated is not a reason to
+// refuse to run.
+func rotateLogIfLarge(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < maxLogBytes {
+		return
+	}
+	_ = os.Rename(path, path+".1")
 }

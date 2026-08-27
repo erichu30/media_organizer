@@ -253,10 +253,141 @@ func TestIsRclonePath(t *testing.T) {
 		{"user@host:path", true},
 		{"/local/path", false},
 		{"relative/path", false},
+		// A colon inside a local path does not make it a remote. Treating these as
+		// rclone destinations sent the whole run to a remote name that never existed.
+		{"/Volumes/Trips/2024:Japan", false},
+		{"./out:staging", false},
+		{"~/Pictures/2024:trip", false},
+		{"photos:2024/sorted", true}, // bare token before the colon — a real remote
+		{"C:\\Users\\me\\Photos", false},
+		{"D:/Photos", false},
+		{":memory", false}, // empty remote name
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
 			assert.Equal(t, tc.want, isRclonePath(tc.in))
 		})
+	}
+}
+
+// ---- validateConfig ----
+
+// TestValidateConfig_Defaults confirms an untouched config passes, so the checks
+// below are rejecting bad input rather than the defaults.
+func TestValidateConfig_Defaults(t *testing.T) {
+	resetFlags(t, []string{"-i", "/input", "-o", "/output"})
+	assert.NoError(t, validateConfig(NewConfig()))
+}
+
+// TestValidateConfig_RejectsUnusableValues covers the flag values that used to fail
+// only at run time: -workers 0 hung forever with an empty screen, and a negative
+// -buffer panicked inside make(chan).
+func TestValidateConfig_RejectsUnusableValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantMsg string
+	}{
+		{"zero workers", func(c *Config) { c.Workers = 0 }, "-workers"},
+		{"negative workers", func(c *Config) { c.Workers = -3 }, "-workers"},
+		{"too many workers", func(c *Config) { c.Workers = maxWorkers + 1 }, "-workers"},
+		{"negative buffer", func(c *Config) { c.Buffer = -1 }, "-buffer"},
+		{"negative retries", func(c *Config) { c.Retries = -1 }, "-retries"},
+		{"negative threshold", func(c *Config) { c.RemoteFailThreshold = -1 }, "-remote-fail-threshold"},
+		{"unknown conflict policy", func(c *Config) { c.OnConflict = "clobber" }, "-on-conflict"},
+		{"empty log path", func(c *Config) { c.LogPath = "" }, "-log"},
+		{"estimate on local dest", func(c *Config) { c.EstimateTransfer = true }, "-estimate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				InputPath: "/input", OutputPath: "/output",
+				Workers: 8, Buffer: 100, Retries: 3,
+				RemoteFailThreshold: 5, OnConflict: ConflictRename, LogPath: defaultLogPath,
+			}
+			tc.mutate(cfg)
+
+			err := validateConfig(cfg)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMsg)
+		})
+	}
+}
+
+func TestValidateConfig_EstimateAllowedOnRemote(t *testing.T) {
+	cfg := &Config{
+		InputPath: "/input", OutputPath: "remote:/photos", IsRemote: true,
+		Workers: 8, Buffer: 100, Retries: 3,
+		RemoteFailThreshold: 5, OnConflict: ConflictRename, LogPath: defaultLogPath,
+		EstimateTransfer: true,
+	}
+	assert.NoError(t, validateConfig(cfg))
+}
+
+// ---- new flags ----
+
+func TestNewConfig_ConflictAndLogFlags(t *testing.T) {
+	resetFlags(t, []string{"-i", "/in", "-o", "/out", "-on-conflict", "skip", "-log", "/tmp/run.log"})
+	cfg := NewConfig()
+
+	assert.Equal(t, ConflictSkip, cfg.OnConflict)
+	assert.Equal(t, "/tmp/run.log", cfg.LogPath)
+}
+
+func TestNewConfig_ConflictDefaultsToRename(t *testing.T) {
+	resetFlags(t, []string{"-i", "/in", "-o", "/out"})
+	cfg := NewConfig()
+
+	assert.Equal(t, ConflictRename, cfg.OnConflict, "the default must never lose a file")
+	assert.Equal(t, defaultLogPath, cfg.LogPath)
+}
+
+// ---- log rotation ----
+
+func TestRotateLogIfLarge(t *testing.T) {
+	t.Run("small log is left alone", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "run.log")
+		require.NoError(t, os.WriteFile(path, []byte("short"), 0644))
+
+		rotateLogIfLarge(path)
+
+		assert.FileExists(t, path)
+		assert.NoFileExists(t, path+".1")
+	})
+
+	t.Run("oversized log is rotated", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "run.log")
+		require.NoError(t, os.WriteFile(path, make([]byte, maxLogBytes+1), 0644))
+
+		rotateLogIfLarge(path)
+
+		assert.NoFileExists(t, path)
+		assert.FileExists(t, path+".1")
+	})
+
+	t.Run("missing log is not an error", func(t *testing.T) {
+		assert.NotPanics(t, func() { rotateLogIfLarge(filepath.Join(t.TempDir(), "absent.log")) })
+	})
+}
+
+// ---- excluded directories ----
+
+// TestIsExcludedDir covers the directories that are full of media-extension files
+// that are not the user's photos — a Synology @eaDir holds one SYNOPHOTO_THUMB_*.jpg
+// per real photo, and a Photos library bundle comes apart if it is reorganized.
+func TestIsExcludedDir(t *testing.T) {
+	excluded := []string{
+		".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100", ".Trashes",
+		"@eaDir", "#recycle", "$RECYCLE.BIN", ".git",
+		"Photos Library.photoslibrary", "Trip.LRDATA",
+	}
+	for _, name := range excluded {
+		t.Run(name, func(t *testing.T) { assert.True(t, isExcludedDir(name)) })
+	}
+
+	kept := []string{"2023", "05", "Holidays", "photos", "eaDir", "library"}
+	for _, name := range kept {
+		t.Run("keeps "+name, func(t *testing.T) { assert.False(t, isExcludedDir(name)) })
 	}
 }
