@@ -57,7 +57,7 @@ The actual data transfer is fast; the connection setup cost dominates for small 
 Configure OpenSSH ControlMaster multiplexing via `~/.ssh/config`:
 
 ```
-Host 192.168.0.83
+Host nas.example.lan
     ControlMaster auto
     ControlPath ~/.ssh/control-%C
     ControlPersist 60s
